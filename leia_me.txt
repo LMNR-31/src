@@ -32,7 +32,20 @@ ros2 run drone_control pouso --ros-args \
   -p x:=3.0 \
   -p y:=-2.0
   
-#missão pouso e takeoff
+# missão P+T (takeoff → 5s → pouso em sequência automática)
+ros2 run drone_control missao_P_T
+# ou com parâmetros
+ros2 run drone_control missao_P_T --ros-args \
+  -p uav_name:=uav1 \
+  -p takeoff_altitude:=1.5 \
+  -p wait_sec:=5.0 \
+  -p use_current_xy:=true
+# ou com ponto de pouso fixo
+ros2 run drone_control missao_P_T --ros-args \
+  -p use_current_xy:=false \
+  -p x:=3.0 \
+  -p y:=-2.0 \
+  -p landing_z:=0.05
 
 
 # camera 
