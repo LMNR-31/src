@@ -384,6 +384,11 @@ private:
   // ── Control flags ────────────────────────────────────────────────────────
   bool enabled_{true};
   bool override_active_{false};
+  /// Gate for /mission_waypoints processing.
+  /// False during normal trajectory execution; set to true by
+  /// finalize_trajectory_complete() once the full trajectory has been visited.
+  /// Reset to false when a new multi-pose trajectory arrives via /waypoints.
+  bool mission_enabled_{false};
   /// Loop guard: skip the next /waypoint_goal message coming from our own publisher.
   int skip_self_waypoint_goal_count_{0};
   /// Loop guard: skip the next /waypoints message coming from our own publisher.

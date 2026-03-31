@@ -66,26 +66,19 @@ public:
             std::bind(&SupervisorNode::process_queue, this));
 
         RCLCPP_INFO(this->get_logger(),
-            "Supervisor node started! (monitorando /waypoint_reached, /trajectory_progress, /trajectory_finished) | min_waypoint_idx_to_trigger=%d",
-            min_waypoint_idx_to_trigger_);
+            "Supervisor node started! (monitorando /waypoint_reached, /trajectory_progress, "
+            "/trajectory_finished) | mission_manager disparado UMA vez ao final da trajetória");
     }
 
 private:
     // ── Called on each /waypoint_reached message ───────────────────────────
+    // mission_manager is NOT triggered per waypoint — it fires only once at the
+    // end of the full trajectory (see progress_callback / bool_callback).
     void waypoint_reached_callback(const std_msgs::msg::Int32::SharedPtr msg) {
         int wp = msg->data;
-        if (wp < min_waypoint_idx_to_trigger_) {
-            RCLCPP_INFO(this->get_logger(),
-                "Waypoint %d ignorado — mission_manager só é executado a partir do waypoint %d.",
-                wp, min_waypoint_idx_to_trigger_);
-            return;  // skip waypoints below threshold: no landing/takeoff cycle
-        }
-        if (wp == last_launched_waypoint_idx_) {
-            return;  // already enqueued for this index
-        }
-        last_launched_waypoint_idx_ = wp;
-        RCLCPP_INFO(this->get_logger(), "Waypoint %d atingido! Enfileirando mission_manager...", wp);
-        pending_queue_.push(wp);
+        RCLCPP_INFO(this->get_logger(),
+            "📍 Waypoint %d atingido — mission_manager será ativado apenas ao final da trajetória.",
+            wp);
     }
 
     // ── Called when trajectory_progress >= 100 ─────────────────────────────
@@ -96,17 +89,13 @@ private:
         if (msg->data >= 100.0f && !trajectory_done_received_) {
             trajectory_done_received_ = true;
             trajectory_done_queued_   = true;
-            if (pending_queue_.empty() && mission_manager_pid_ < 0) {
-                RCLCPP_INFO(this->get_logger(),
-                    "Progresso %.1f%% — trajetória concluída, nenhuma missão pendente: "
-                    "retorno à origem será publicado em /waypoints no próximo ciclo de fila.",
-                    msg->data);
-            } else {
-                RCLCPP_INFO(this->get_logger(),
-                    "Progresso %.1f%% — trajetória concluída, retorno à origem via /waypoints será publicado após missões pendentes "
-                    "(fila=%zu, mission_manager_pid=%d).",
-                    msg->data, pending_queue_.size(), static_cast<int>(mission_manager_pid_));
-            }
+            // Fire mission_manager exactly ONCE at the end of the trajectory.
+            // -1 is used as waypoint_idx (not a real index; only for logging).
+            pending_queue_.push(-1);
+            RCLCPP_INFO(this->get_logger(),
+                "🏁 Progresso %.1f%% — trajetória concluída. "
+                "Disparando mission_manager UMA única vez ao final da trajetória (fila=%zu).",
+                msg->data, pending_queue_.size());
         }
     }
 
@@ -115,16 +104,13 @@ private:
         if (msg->data && !trajectory_done_received_) {
             trajectory_done_received_ = true;
             trajectory_done_queued_   = true;
-            if (pending_queue_.empty() && mission_manager_pid_ < 0) {
-                RCLCPP_INFO(this->get_logger(),
-                    "Sinal de trajetória concluída recebido, nenhuma missão pendente: "
-                    "retorno à origem via /waypoints será publicado no próximo ciclo de fila.");
-            } else {
-                RCLCPP_INFO(this->get_logger(),
-                    "Sinal de trajetória concluída recebido — retorno à origem via /waypoints será publicado após missões pendentes "
-                    "(fila=%zu, mission_manager_pid=%d).",
-                    pending_queue_.size(), static_cast<int>(mission_manager_pid_));
-            }
+            // Fire mission_manager exactly ONCE at the end of the trajectory.
+            // -1 is used as waypoint_idx (not a real index; only for logging).
+            pending_queue_.push(-1);
+            RCLCPP_INFO(this->get_logger(),
+                "🏁 Sinal /trajectory_finished recebido — trajetória concluída. "
+                "Disparando mission_manager UMA única vez ao final da trajetória (fila=%zu).",
+                pending_queue_.size());
         }
     }
 
@@ -228,7 +214,7 @@ private:
         pending_queue_.pop();
 
         RCLCPP_INFO(this->get_logger(),
-            "Iniciando mission_manager para waypoint %d...", wp);
+            "🚀 [MISSION FINAL] Iniciando mission_manager ao final da trajetória (waypoint_idx=%d)...", wp);
 
         // Build the waypoint_idx ROS parameter string before fork so we own
         // the memory in the child (no risk of dangling pointer after exec).
