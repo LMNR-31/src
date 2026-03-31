@@ -143,6 +143,15 @@ ament_target_dependencies(takeoff_waypoint_publisher_8s
 )
 install(TARGETS takeoff_waypoint_publisher_8s DESTINATION lib/${PROJECT_NAME})
 
+add_executable(takeoff src/takeoff.cpp)
+ament_target_dependencies(takeoff
+  rclcpp
+  geometry_msgs
+  nav_msgs
+  mavros_msgs
+)
+install(TARGETS takeoff DESTINATION lib/${PROJECT_NAME})
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
