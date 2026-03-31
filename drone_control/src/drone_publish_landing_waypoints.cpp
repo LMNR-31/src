@@ -116,6 +116,16 @@ private:
         break;
 
       case LandingPhase::DONE:
+        // Publish an empty PoseArray to clear /mission_waypoints and prevent
+        // the controller from following stale mission waypoints after shutdown.
+        {
+          auto clear_msg = geometry_msgs::msg::PoseArray();
+          clear_msg.header.frame_id = "map";
+          clear_msg.header.stamp = this->now();
+          waypoints_pub_->publish(clear_msg);
+          RCLCPP_INFO(this->get_logger(),
+            "🧹 /mission_waypoints limpo (PoseArray vazio publicado).");
+        }
         RCLCPP_INFO(this->get_logger(), "✅ Finalizando nó drone_publish_landing_waypoints");
         timer_->cancel();
         rclcpp::shutdown();

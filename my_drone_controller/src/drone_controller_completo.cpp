@@ -269,6 +269,7 @@ void DroneControllerCompleto::init_variables()
   post_offboard_stream_count_ = 0;
   post_offboard_stream_done_ = false;
   setpoint_pub_time_initialized_ = false;
+  mission_enabled_ = false;
 }
 
 // ============================================================
@@ -756,6 +757,13 @@ void DroneControllerCompleto::waypoints_callback(
     mission_waypoints_.clear();
     mission_wp_follow_idx_ = 0;
     last_published_mission_wp_idx_ = -1;
+    // New trajectory: disable mission gate until this trajectory finishes.
+    if (mission_enabled_) {
+      mission_enabled_ = false;
+      RCLCPP_INFO(this->get_logger(),
+        "🔒 [MISSION] Nova trajetória recebida — mission_enabled_=false. "
+        "/mission_waypoints será ignorado durante a execução.");
+    }
 
     log_trajectory_waypoints_3d(trajectory_waypoints_);
     publish_waypoints_status();
@@ -800,6 +808,18 @@ void DroneControllerCompleto::mission_waypoints_callback(
   std::lock_guard<std::mutex> lock(mutex_);
 
   if (msg->poses.empty()) { return; }
+
+  // ── Gate: ignore /mission_waypoints until trajectory is fully complete ───
+  // mission_enabled_ is set to true only in finalize_trajectory_complete(),
+  // preventing any stale or spurious /mission_waypoints messages from
+  // interrupting an ongoing trajectory.
+  if (!mission_enabled_) {
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+      "🔒 [MISSION] /mission_waypoints recebido com %zu pose(s) — trajetória ainda em "
+      "andamento (mission_enabled_=false). Ignorando até o final da trajetória.",
+      msg->poses.size());
+    return;
+  }
 
   // ── Return-home: single pose received after trajectory completion ─────────
   // When the supervisor publishes the home waypoint after all mission cycles
@@ -2013,8 +2033,14 @@ void DroneControllerCompleto::finalize_trajectory_complete()
   progress_msg.data = 100.0;
   progress_publisher_->publish(progress_msg);
 
+  // Enable /mission_waypoints processing now that the trajectory is fully complete.
+  // The supervisor will trigger mission_manager exactly once.
+  mission_enabled_ = true;
+
   RCLCPP_INFO(this->get_logger(),
     "📢 Trajetória terminada! Publicado /trajectory_finished = true");
+  RCLCPP_INFO(this->get_logger(),
+    "🚦 [MISSION] mission_enabled_=true — aguardando /mission_waypoints do supervisor.");
 }
 
 void DroneControllerCompleto::handle_mission_interrupt_in_state3()
@@ -2183,11 +2209,12 @@ void DroneControllerCompleto::handle_state3_trajectory()
       // Check whether the trajectory is now complete.
       if (current_waypoint_idx_ >= static_cast<int>(trajectory_waypoints_.size())) {
         finalize_trajectory_complete();
-        // Enter mission interrupt so mission_manager runs its land/disarm/rearm/takeoff
-        // cycle for the last reached waypoint (including WP0).
+        // Enter WAIT_LAND_WP so the controller accepts the landing waypoints
+        // published by mission_manager (triggered once by the supervisor at
+        // the end of the full trajectory).
         RCLCPP_INFO(this->get_logger(),
-          "🔄 [MISSION WAIT_LAND_WP] Fim de trajetória — iniciando ciclo de missão para WP%d. "
-          "Aguardando /mission_waypoints de pouso.",
+          "🔄 [MISSION WAIT_LAND_WP] Fim de trajetória (WP%d) — missão habilitada. "
+          "Aguardando /mission_waypoints de pouso do supervisor.",
           last_waypoint_reached_idx_);
         mission_cycle_phase_ = MissionCyclePhase::WAIT_LAND_WP;
         mission_waypoints_.clear();
@@ -2196,16 +2223,12 @@ void DroneControllerCompleto::handle_state3_trajectory()
         return;
       }
 
-      // Enter mission interrupt mode: wait for /mission_waypoints before
-      // continuing to the next main waypoint (including WP0).
+      // Intermediate waypoint reached: continue to the next without pausing
+      // for a mission cycle.  Mission is activated only at the end of the
+      // full trajectory (see finalize_trajectory_complete above).
       RCLCPP_INFO(this->get_logger(),
-        "🔄 [MISSION WAIT_LAND_WP] Iniciando ciclo de missão para WP%d. "
-        "Trajetória pausada; aguardando /mission_waypoints de pouso.",
+        "➡️ Waypoint %d atingido — avançando para próximo waypoint da trajetória.",
         last_waypoint_reached_idx_);
-      mission_cycle_phase_ = MissionCyclePhase::WAIT_LAND_WP;
-      mission_waypoints_.clear();
-      mission_wp_follow_idx_ = 0;
-      last_published_mission_wp_idx_ = -1;
     }
   }
 }
@@ -2237,13 +2260,21 @@ void DroneControllerCompleto::mission_interrupt_done_callback(
   // fired yet (e.g. drone still climbing).  Set controlador_ativo_ and clear
   // mission state so the FSM resumes trajectory as soon as state_voo_ reaches 2.
   RCLCPP_INFO(this->get_logger(),
-    "✅ [MISSION INTERRUPT DONE] Retomando trajetória em WP[%d] (fase anterior: %s).",
-    current_waypoint_idx_, mission_cycle_phase_name(mission_cycle_phase_));
+    "✅ [MISSION INTERRUPT DONE] Missão final concluída (fase anterior: %s). "
+    "Retornando ao modo /waypoints normal.",
+    mission_cycle_phase_name(mission_cycle_phase_));
 
   mission_cycle_phase_ = MissionCyclePhase::NONE;
   mission_waypoints_.clear();
   mission_wp_follow_idx_ = 0;
   last_published_mission_wp_idx_ = -1;
+
+  // Reset mission gate: system returns to normal /waypoints-based navigation.
+  // mission_enabled_ will be re-set if a new trajectory finishes in the future.
+  mission_enabled_ = false;
+  RCLCPP_INFO(this->get_logger(),
+    "🧹 [MISSION] mission_enabled_=false — /mission_waypoints limpo/ignorado. "
+    "Sistema volta ao modo /waypoints normal.");
 
   if (!trajectory_waypoints_.empty() &&
       current_waypoint_idx_ < static_cast<int>(trajectory_waypoints_.size()))
@@ -2255,9 +2286,9 @@ void DroneControllerCompleto::mission_interrupt_done_callback(
     // Republish the stored trajectory waypoints so observers can see the active set.
     publish_waypoints_status();
   } else {
-    RCLCPP_WARN(this->get_logger(),
-      "⚠️ [MISSION] Nenhum waypoint restante em current_waypoint_idx_=%d (tamanho=%zu). "
-      "Trajetória concluída.",
+    RCLCPP_INFO(this->get_logger(),
+      "ℹ️ [MISSION] Nenhum waypoint de trajetória restante (idx=%d, tamanho=%zu). "
+      "Aguardando novos /waypoints.",
       current_waypoint_idx_, trajectory_waypoints_.size());
   }
 }
