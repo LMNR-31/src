@@ -114,6 +114,67 @@ poses:
 
 ---
 
+## `pouso` — Publish a Landing Point Anywhere on the Map
+
+The `pouso` node (Portuguese for *landing*) lets you command the drone to land at
+**any arbitrary XY position** on the map.  It publishes a two-waypoint descent
+sequence to `/waypoints`, which is consumed directly by `my_drone_controller`:
+
+| Waypoint | Description |
+|----------|-------------|
+| WP 0 | Approach hover — same altitude as the drone's current Z, above the target XY |
+| WP 1 | Ground — target XY at `landing_z` (default 0.05 m) |
+
+### Quick start
+
+**Land at the drone's current XY position (default behaviour):**
+```bash
+ros2 run drone_control pouso
+```
+
+**Land at a specific map coordinate (x=3.0, y=−2.0):**
+```bash
+ros2 run drone_control pouso --ros-args \
+  -p use_current_xy:=false \
+  -p x:=3.0 \
+  -p y:=-2.0
+```
+
+**Full parameter set:**
+```bash
+ros2 run drone_control pouso --ros-args \
+  -p uav_name:=uav1 \
+  -p use_current_xy:=false \
+  -p x:=5.0 \
+  -p y:=2.5 \
+  -p landing_z:=0.05 \
+  -p frame_id:=map \
+  -p check_after_sec:=20.0
+```
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `uav_name` | `uav1` | UAV namespace prefix (used for MAVROS topics) |
+| `use_current_xy` | `true` | Use live odometry XY; set `false` to specify `x`/`y` |
+| `x` | `0.0` | Target landing X coordinate (ENU, m) — used when `use_current_xy=false` |
+| `y` | `0.0` | Target landing Y coordinate (ENU, m) — used when `use_current_xy=false` |
+| `landing_z` | `0.05` | Final ground altitude (m) |
+| `frame_id` | `map` | Coordinate frame for the published `PoseArray` |
+| `check_after_sec` | `15.0` | Timeout (s) before the node shuts down if landing is not confirmed |
+| `rate_hz` | `10.0` | Timer rate (Hz) |
+
+### Topics
+
+| Topic | Direction | Type | Description |
+|-------|-----------|------|-------------|
+| `/waypoints` | Published | `geometry_msgs/PoseArray` | Landing waypoints consumed by `my_drone_controller` |
+| `/{uav}/mavros/local_position/odom` | Subscribed | `nav_msgs/Odometry` | Current drone position |
+| `/{uav}/mavros/state` | Subscribed | `mavros_msgs/State` | FCU connection status |
+
+---
+
 ## Key Parameters
 
 ### `lpv_mpc_drone_node`
