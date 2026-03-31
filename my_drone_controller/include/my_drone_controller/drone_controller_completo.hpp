@@ -1,0 +1,467 @@
+#ifndef MY_DRONE_CONTROLLER__DRONE_CONTROLLER_COMPLETO_HPP_
+#define MY_DRONE_CONTROLLER__DRONE_CONTROLLER_COMPLETO_HPP_
+
+#include "rclcpp/rclcpp.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/pose_array.hpp"
+#include "nav_msgs/msg/odometry.hpp"
+#include "mavros_msgs/srv/set_mode.hpp"
+#include "mavros_msgs/srv/command_bool.hpp"
+#include "mavros_msgs/msg/state.hpp"
+#include "mavros_msgs/msg/position_target.hpp"
+#include "rcl_interfaces/msg/set_parameters_result.hpp"
+#include "std_msgs/msg/bool.hpp"
+#include "std_msgs/msg/float32.hpp"
+#include "std_msgs/msg/int32.hpp"
+#include "drone_control/msg/yaw_override.hpp"
+#include "drone_control/msg/waypoint4_d.hpp"
+#include "drone_control/msg/waypoint4_d_array.hpp"
+#include "drone_config.h"
+#include "my_drone_controller/command_queue.hpp"
+#include "my_drone_controller/waypoint_validation.hpp"
+
+#include <mutex>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace drone_control {
+
+/// Phase of a per-waypoint mission-interrupt cycle (land → disarm → rest → re-arm → takeoff).
+/// Using an explicit phase instead of a single boolean prevents the race where
+/// mission_interrupt_active_ is cleared before the takeoff waypoint arrives.
+enum class MissionCyclePhase {
+  NONE,            ///< No mission interrupt active.
+  WAIT_LAND_WP,    ///< Waypoint reached; waiting for landing waypoints on /mission_waypoints.
+  FOLLOW_LAND,     ///< Landing waypoints received; drone is descending toward ground.
+  WAIT_TAKEOFF_WP, ///< Landing + DISARM complete; waiting for takeoff waypoint on /mission_waypoints.
+  FOLLOW_TAKEOFF,  ///< Takeoff waypoint received; drone ascending; trajectory resumes at z >= 1.5 m.
+  RETURN_HOME,     ///< Trajectory complete; single-pose home waypoint received; drone navigating to origin.
+};
+
+/**
+ * @brief Complete drone controller node with command tracking and safety.
+ *
+ * Implements a 5-state flight state machine:
+ *  - State 0: Waiting for waypoint goal
+ *  - State 1: Takeoff (OFFBOARD + ARM, climb to hover_altitude)
+ *  - State 2: Hover (waiting for trajectory)
+ *  - State 3: Executing trajectory
+ *  - State 4: Landing — waits for ground detection, then DISARMs and transitions
+ *              to State 0 to accept a new takeoff command.
+ *
+ * All drone commands are registered in a CommandQueue so that every
+ * operation can be audited and timed out automatically.
+ *
+ * There is a single universal landing flow: after landing is detected the
+ * drone always proceeds to DISARM; once the FCU confirms DISARM the FSM
+ * transitions to State 0, ready for the next takeoff.
+ * There are no landing modes (Modo A / Modo B) — only this single flow.
+ */
+class DroneControllerCompleto : public rclcpp::Node
+{
+public:
+  // type_mask bits for PositionTarget (1 = ignore that field)
+  static constexpr uint16_t IGNORE_VX       = (1 << 3);
+  static constexpr uint16_t IGNORE_VY       = (1 << 4);
+  static constexpr uint16_t IGNORE_VZ       = (1 << 5);
+  static constexpr uint16_t IGNORE_AFX      = (1 << 6);
+  static constexpr uint16_t IGNORE_AFY      = (1 << 7);
+  static constexpr uint16_t IGNORE_AFZ      = (1 << 8);
+  static constexpr uint16_t IGNORE_YAW      = (1 << 10);
+  static constexpr uint16_t IGNORE_YAW_RATE = (1 << 11);
+
+  // Position + yaw_rate; ignore velocity, acceleration, yaw angle
+  static constexpr uint16_t MASK_POS_YAWRATE =
+    IGNORE_VX | IGNORE_VY | IGNORE_VZ | IGNORE_AFX | IGNORE_AFY | IGNORE_AFZ | IGNORE_YAW;
+
+  // Position + absolute yaw; ignore velocity, acceleration, yaw_rate
+  static constexpr uint16_t MASK_POS_YAW =
+    IGNORE_VX | IGNORE_VY | IGNORE_VZ | IGNORE_AFX | IGNORE_AFY | IGNORE_AFZ | IGNORE_YAW_RATE;
+
+  // Position only; ignore velocity, acceleration, yaw angle and yaw_rate
+  static constexpr uint16_t MASK_POS_ONLY = MASK_POS_YAWRATE | IGNORE_YAW_RATE;
+
+  /// Watchdog: minimum guaranteed setpoint publish rate (Hz).
+  static constexpr double MIN_SETPOINT_RATE_HZ = 20.0;
+  /// Watchdog: maximum allowed silence between setpoint publishes (0.05 s = 1 / 20 Hz).
+  static constexpr double MAX_SETPOINT_SILENCE_S = 1.0 / MIN_SETPOINT_RATE_HZ;
+
+  /// Minimum altitude [m] the drone must reach after a mission-interrupt re-arm
+  /// before the FSM considers the takeoff complete and resumes the main trajectory.
+  static constexpr double MISSION_RESUME_ALTITUDE_M = 1.5;
+
+  /// Minimum number of setpoints to publish before requesting ARM+OFFBOARD.
+  /// At 100 Hz this equates to ~200 ms of continuous streaming, which is
+  /// enough for the PX4 FCU to accept the ARM command in OFFBOARD mode.
+  static constexpr int INITIAL_STREAM_THRESHOLD = 20;
+
+  /// Number of setpoints to publish AFTER the FCU confirms OFFBOARD mode and
+  /// BEFORE sending the ARM command.  At 100 Hz (10 ms/iteration) this equals
+  /// 1.5 seconds of continuous streaming — equivalent to 30 setpoints at 50 ms
+  /// each as recommended by the PX4/MAVROS offboard guide.  The FCU needs to
+  /// see a stable setpoint stream in OFFBOARD mode before it will accept ARM.
+  static constexpr int POST_OFFBOARD_STREAM_THRESHOLD = 150;
+
+  DroneControllerCompleto();
+
+private:
+  // ── Setup ────────────────────────────────────────────────────────────────
+  void load_parameters();
+  void setup_publishers();
+  void setup_subscribers();
+  void setup_services();
+  void init_variables();
+
+  // ── Landing / activation helpers ────────────────────────────────────────
+  void trigger_landing(double z);
+  void activate_offboard_arm_if_needed();
+
+  // ── Pre-ARM setpoint streaming ───────────────────────────────────────────
+  /**
+   * @brief Stream initial position setpoints before requesting ARM+OFFBOARD.
+   *
+   * PX4/MAVROS will reject an ARM command in OFFBOARD mode unless the FCU
+   * has been receiving a continuous stream of setpoints on the
+   * setpoint_raw/local topic BEFORE and DURING the ARM/OFFBOARD request.
+   * This method publishes INITIAL_STREAM_THRESHOLD setpoints (≥20) at the
+   * target hover position so that the FCU accepts the subsequent ARM command.
+   *
+   * Call from handle_state1_takeoff() before request_arm_and_offboard_activation().
+   */
+  void stream_initial_setpoints();
+
+  /**
+   * @brief Stream position setpoints for 1.5 s AFTER the FCU confirms OFFBOARD.
+   *
+   * Even after OFFBOARD mode is confirmed, the PX4 FCU may still reject ARM if
+   * the setpoint stream has not been running long enough.  Per the PX4/MAVROS
+   * offboard guide, the vehicle must receive a continuous stream of setpoints
+   * for at least 1.5 seconds in OFFBOARD mode before ARM is accepted.  This method
+   * publishes POST_OFFBOARD_STREAM_THRESHOLD setpoints (150 × 10 ms = 1.5 s at
+   * 100 Hz, providing the same duration as the PX4/MAVROS recommendation of 30
+   * setpoints at 50 ms each) and sets post_offboard_stream_done_ once the
+   * threshold is reached.
+   *
+   * Call from handle_state1_takeoff() between OFFBOARD confirmation (step 3)
+   * and the ARM request (step 4).
+   */
+  void stream_post_offboard_setpoints();
+
+  // ── Parameter handlers ───────────────────────────────────────────────────
+  bool apply_enabled_param(const rclcpp::Parameter & p,
+                           rcl_interfaces::msg::SetParametersResult & result);
+  bool apply_override_active_param(const rclcpp::Parameter & p,
+                                   rcl_interfaces::msg::SetParametersResult & result);
+  rcl_interfaces::msg::SetParametersResult onSetParameters(
+    const std::vector<rclcpp::Parameter> & params);
+
+  // ── FCU service requests ─────────────────────────────────────────────────
+  void request_offboard();
+  void request_arm();
+  void request_disarm();
+
+  // ── Sensor callbacks ─────────────────────────────────────────────────────
+  void odometry_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
+  void yaw_override_callback(const drone_control::msg::YawOverride::SharedPtr msg);
+
+  // ── Waypoint callback helpers (3D) ───────────────────────────────────────
+  void handle_landing_waypoint_command(double z);
+  void handle_single_takeoff_waypoint_command(const geometry_msgs::msg::Pose & pose);
+  void log_trajectory_waypoints_3d(const std::vector<geometry_msgs::msg::Pose> & poses);
+  void activate_trajectory_in_hover(size_t waypoint_count);
+
+  // ── Takeoff XY sanitization ───────────────────────────────────────────────
+  /// Returns a copy of @p pose with XY overridden by the last latch pose when
+  /// the requested XY is suspiciously close to the origin (within
+  /// takeoff_xy_origin_threshold_m) and a fresh latch pose is available
+  /// (received within latch_pose_max_age_s).  Logs which XY source is used.
+  geometry_msgs::msg::Pose sanitize_takeoff_xy(const geometry_msgs::msg::Pose & pose);
+
+  // ── Waypoint callbacks ───────────────────────────────────────────────────
+  void waypoints_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg);
+  void mission_waypoints_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg);
+
+  // ── Shared waypoint-goal helpers ─────────────────────────────────────────
+  bool check_landing_in_flight(double z);
+  bool handle_state4_disarm_reset();
+  /// Logs a DEBUG snapshot of the key FSM flags; call before/after takeoff setup.
+  void log_takeoff_debug_flags(const char * tag);
+  /// Returns true when the FSM is actively in flight (states 1–3).
+  bool is_in_flight() const { return state_voo_ == 1 || state_voo_ == 2 || state_voo_ == 3; }
+
+  // ── Waypoint-goal callbacks ──────────────────────────────────────────────
+  void waypoint_goal_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
+  void waypoint_goal_4d_callback(const drone_control::msg::Waypoint4D::SharedPtr msg);
+  void waypoints_4d_callback(const drone_control::msg::Waypoint4DArray::SharedPtr msg);
+  /// Called when mission_manager publishes to /mission_interrupt_done after the
+  /// full land/disarm/wait/rearm/takeoff cycle completes.  Resumes the main
+  /// trajectory from current_waypoint_idx_ if it has not already been resumed
+  /// by the altitude-based check in handle_state2_hover().
+  void mission_interrupt_done_callback(const std_msgs::msg::Int32::SharedPtr msg);
+
+  // ── Setpoint publishing ──────────────────────────────────────────────────
+  void publishPositionTarget(double x, double y, double z,
+                             double yaw_rate, uint16_t type_mask);
+  void publishPositionTargetWithYaw(double x, double y, double z, double yaw_rad);
+  /// Publish a hold setpoint using hold_* if valid, otherwise current_*_ned_.
+  void publish_hold_setpoint();
+  /// Publish x, y, z as the current active goal to /waypoint_goal (with self-echo guard).
+  void publish_waypoint_goal_status(double x, double y, double z);
+  /// Publish trajectory_waypoints_ to /waypoints (with self-echo guard).
+  void publish_waypoints_status();
+  /// Heartbeat timer callback: periodically re-publishes the current active goal to /waypoint_goal.
+  void monitor_waypoint_goal_heartbeat();
+  /// Heartbeat timer callback: periodically re-publishes trajectory_waypoints_ to /waypoints.
+  void monitor_waypoints_heartbeat();
+
+  // ── Main control loop ────────────────────────────────────────────────────
+  void control_loop();
+
+  // ── FSM state handlers ───────────────────────────────────────────────────
+  void handle_state0_wait_waypoint();
+
+  // State 1 — takeoff layers
+  void request_arm_and_offboard_activation();
+  /**
+   * @brief Wait for FCU to confirm OFFBOARD mode after a SET_MODE OFFBOARD request.
+   *
+   * Per PX4/MAVROS best practice, ARM must only be sent AFTER the FCU reports
+   * mode == "OFFBOARD".  Sending ARM and OFFBOARD simultaneously causes the ARM
+   * to be rejected even when the OFFBOARD request succeeds.  This method polls
+   * current_state_.mode and sets offboard_mode_confirmed_ once the FCU confirms
+   * the transition, or resets offboard_activated_ on timeout so the sequence
+   * can be retried cleanly.
+   */
+  void wait_for_offboard_mode();
+  bool wait_for_offboard_arm_confirmation();
+  void publish_takeoff_climb_setpoint(double target_alt);
+  void finalize_takeoff_on_altitude_reached(double target_alt);
+  void handle_state1_takeoff();
+
+  // State 2 — hover
+  void handle_state2_hover();
+
+  // State 3 — trajectory sub-routines
+  bool detect_and_handle_landing_in_trajectory();
+  bool initialize_trajectory();
+  double compute_yaw_for_trajectory_waypoint(int idx, bool at_last_wp);
+  void publish_trajectory_waypoint_setpoint(int idx);
+  void log_trajectory_progress(int idx);
+  void finalize_trajectory_complete();
+  void handle_mission_interrupt_in_state3();
+  void handle_state3_trajectory();
+
+  // State 4 — landing completers
+  void complete_landing();
+  void handle_state4_landing();
+
+  // ── Configuration ─────────────────────────────────────────────────────────
+  DroneConfig config_;
+
+  // ── Publishers ───────────────────────────────────────────────────────────
+  rclcpp::Publisher<mavros_msgs::msg::PositionTarget>::SharedPtr raw_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr trajectory_finished_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr progress_publisher_;
+  rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr waypoint_reached_pub_;
+  /// Publishes the trajectory waypoint position at the moment it is reached,
+  /// so that drone_publish_landing_waypoints can use it as an accurate XY
+  /// reference instead of relying on the live MAVROS pose.
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr mission_latch_pose_pub_;
+  /// Publishes the current active waypoint goal for external monitoring.
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr waypoint_goal_pub_;
+  /// Publishes the currently stored trajectory waypoints for external monitoring.
+  rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr waypoints_pub_;
+
+  // ── Subscribers ──────────────────────────────────────────────────────────
+  rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr state_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr waypoints_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr mission_waypoints_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr waypoint_goal_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<drone_control::msg::YawOverride>::SharedPtr yaw_override_sub_;
+  rclcpp::Subscription<drone_control::msg::Waypoint4D>::SharedPtr waypoint_goal_4d_sub_;
+  rclcpp::Subscription<drone_control::msg::Waypoint4DArray>::SharedPtr waypoints_4d_sub_;
+  /// Receives the completion signal from mission_manager after the full
+  /// land/disarm/wait/rearm/takeoff cycle has finished, enabling the
+  /// controller to resume the main trajectory from the next waypoint.
+  rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr mission_interrupt_done_sub_;
+
+  // ── Service clients ───────────────────────────────────────────────────────
+  rclcpp::Client<mavros_msgs::srv::SetMode>::SharedPtr mode_client_;
+  rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedPtr arm_client_;
+
+  // ── Timer ────────────────────────────────────────────────────────────────
+  rclcpp::TimerBase::SharedPtr timer_;
+  /// Heartbeat timer for periodic /waypoint_goal re-publish.
+  rclcpp::TimerBase::SharedPtr monitor_waypoint_goal_timer_;
+  /// Heartbeat timer for periodic /waypoints re-publish.
+  rclcpp::TimerBase::SharedPtr monitor_waypoints_timer_;
+
+  // ── FCU state ────────────────────────────────────────────────────────────
+  mavros_msgs::msg::State current_state_;
+
+  // ── FSM state variables ───────────────────────────────────────────────────
+  int state_voo_;   ///< 0=wait, 1=takeoff, 2=hover, 3=trajectory, 4=landing
+  bool controlador_ativo_;
+  bool pouso_em_andamento_;
+  bool offboard_activated_;
+  /// True once FCU confirms mode == "OFFBOARD" following a SET_MODE request.
+  /// ARM is sent only after this flag is set, per PX4/MAVROS recommendation.
+  bool offboard_mode_confirmed_;
+  /// True once request_arm() has been called following OFFBOARD confirmation.
+  bool arm_requested_;
+  bool activation_confirmed_;
+  rclcpp::Time activation_time_;
+  int cycle_count_;
+  int takeoff_counter_;
+
+  // ── Landing timeout tracking ──────────────────────────────────────────────
+  double last_z_;
+  rclcpp::Time pouso_start_time_;
+  bool pouso_start_time_set_;
+  /// true when DISARM has been requested but FCU confirmation is still pending
+  bool disarm_requested_;
+
+  // ── Waypoint tracking ────────────────────────────────────────────────────
+  geometry_msgs::msg::PoseStamped last_waypoint_goal_;
+  bool waypoint_goal_received_;
+  double trajectory_setpoint_[3];
+
+  // ── Trajectory state ─────────────────────────────────────────────────────
+  std::vector<geometry_msgs::msg::Pose> trajectory_waypoints_;
+  rclcpp::Time trajectory_start_time_;
+  bool trajectory_started_;
+  int current_waypoint_idx_;
+  double waypoint_duration_;
+  /// Last waypoint index for which /waypoint_reached was published (debounce).
+  /// -1 means no waypoint has been published yet for the current trajectory.
+  int last_waypoint_reached_idx_;
+
+  /// Last mission waypoint index for which /waypoint_goal was published (debounce).
+  /// Reset to -1 when mission_waypoints_ is cleared.
+  int last_published_mission_wp_idx_{-1};
+
+  // ── Mission interrupt state (per-waypoint land/disarm/rearm/takeoff cycle) ──
+  /// Phase of the current per-waypoint mission cycle.  NONE means no cycle is
+  /// active.  Using an explicit phase (rather than a single boolean) prevents
+  /// the race where a single flag is cleared before the takeoff waypoint arrives.
+  MissionCyclePhase mission_cycle_phase_{MissionCyclePhase::NONE};
+  /// Current index into mission_waypoints_ being followed.
+  int mission_wp_follow_idx_{0};
+  /// Waypoints for the current mission cycle (landing or takeoff), received
+  /// on /mission_waypoints.  Cleared at the start of each interrupt cycle.
+  std::vector<geometry_msgs::msg::Pose> mission_waypoints_;
+  /// Target pose for the RETURN_HOME phase (single pose published by the
+  /// supervisor after all mission cycles are complete).
+  geometry_msgs::msg::Pose return_home_target_{};
+
+  // ── Odometry (NED) ───────────────────────────────────────────────────────
+  double current_z_real_;
+  double current_x_ned_;
+  double current_y_ned_;
+  double current_z_ned_;
+  double final_waypoint_yaw_{0.0};
+  bool at_last_waypoint_yaw_fixed_{false};
+
+  // ── Yaw override ─────────────────────────────────────────────────────────
+  bool yaw_override_enabled_;
+  double yaw_rate_cmd_;
+  double yaw_override_timeout_s_;
+  rclcpp::Time last_yaw_cmd_time_;
+  bool hold_valid_;
+  double hold_x_ned_;
+  double hold_y_ned_;
+  double hold_z_ned_;
+
+  // ── 4D waypoint support ───────────────────────────────────────────────────
+  double current_yaw_rad_;
+  double goal_yaw_rad_;
+  bool using_4d_goal_;
+  bool trajectory_4d_mode_;
+  std::vector<double> trajectory_yaws_;
+
+  // ── Control flags ────────────────────────────────────────────────────────
+  bool enabled_{true};
+  bool override_active_{false};
+  /// Loop guard: skip the next /waypoint_goal message coming from our own publisher.
+  int skip_self_waypoint_goal_count_{0};
+  /// Loop guard: skip the next /waypoints message coming from our own publisher.
+  int skip_self_waypoints_count_{0};
+
+  // ── Monitoring heartbeat parameters ──────────────────────────────────────
+  /// Rate (Hz) at which /waypoint_goal is re-published as a heartbeat.
+  double monitor_waypoint_goal_rate_hz_{5.0};
+  /// Rate (Hz) at which /waypoints is re-published as a heartbeat.
+  double monitor_waypoints_rate_hz_{1.0};
+  /// When true, heartbeat publishes are suppressed unless the drone is in flight
+  /// or has an active goal/trajectory (avoids publishing stale data at idle).
+  bool monitor_publish_only_when_active_{true};
+
+  // ── Takeoff target altitude (latched) ────────────────────────────────────
+  /// Fixed takeoff target altitude (metres) for the current climb.
+  ///
+  /// Computed ONCE at takeoff-command-receive time (in
+  /// handle_single_takeoff_waypoint_command() and the 4D equivalent) as:
+  ///   takeoff_target_z_ = std::max(hover_altitude, current_z_real_ + takeoff_z_boost)
+  ///
+  /// There is NO artificial differentiation between the first takeoff and any
+  /// subsequent cycle — the same formula always runs from the actual ground
+  /// altitude measured at the moment the command arrives.  Publishing a fixed
+  /// value (not recomputed each 10 ms cycle) is what prevents the
+  /// infinite-ascent bug: if the target tracked current_z_real_ every cycle
+  /// it would rise together with the drone and never be reached.
+  ///
+  /// A value of -1.0 at the start of handle_state1_takeoff() indicates an
+  /// unexpected path (should never happen in normal operation) and triggers a
+  /// safe fallback computation there.
+  double takeoff_target_z_{-1.0};
+
+  // ── Pre-ARM setpoint streaming counters ──────────────────────────────────
+  /// Number of setpoints published so far in the current pre-ARM stream phase.
+  int initial_stream_count_{0};
+  /// True once INITIAL_STREAM_THRESHOLD setpoints have been published and
+  /// ARM+OFFBOARD can safely be requested from the FSM.
+  bool initial_stream_done_{false};
+
+  // ── Post-OFFBOARD setpoint streaming counters ─────────────────────────────
+  /// Number of setpoints published since OFFBOARD mode was confirmed by the FCU.
+  /// Used to enforce a 1.5-second streaming window before ARM is requested.
+  int post_offboard_stream_count_{0};
+  /// True once POST_OFFBOARD_STREAM_THRESHOLD setpoints have been published
+  /// after OFFBOARD confirmation, so ARM can safely be sent to the FCU.
+  bool post_offboard_stream_done_{false};
+
+  // ── Thread safety ────────────────────────────────────────────────────────
+  std::mutex mutex_;
+
+  // ── Watchdog: tracks last real setpoint publish time ─────────────────────
+  rclcpp::Time last_setpoint_pub_time_;
+  bool setpoint_pub_time_initialized_{false};
+
+  // ── Parameter callback handle ────────────────────────────────────────────
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
+
+  // ── Command queue and IDs ────────────────────────────────────────────────
+  CommandQueue cmd_queue_;
+  std::optional<uint64_t> offboard_cmd_id_;
+  std::optional<uint64_t> arm_cmd_id_;
+  std::optional<uint64_t> disarm_cmd_id_;
+  std::optional<uint64_t> takeoff_cmd_id_;
+  std::optional<uint64_t> hover_cmd_id_;
+  std::optional<uint64_t> trajectory_cmd_id_;
+  std::optional<uint64_t> land_cmd_id_;
+
+  // ── Latch pose cache (local copy of last published /mission_latch_pose) ──
+  /// True once at least one latch pose has been stored locally.
+  bool has_latch_pose_{false};
+  /// Position of the last reached trajectory waypoint, mirrored from the
+  /// most recent mission_latch_pose_pub_->publish() call.
+  geometry_msgs::msg::Pose last_latch_pose_;
+  /// Timestamp of the last stored latch pose (used for staleness check).
+  rclcpp::Time last_latch_pose_time_;
+};
+
+}  // namespace drone_control
+
+#endif  // MY_DRONE_CONTROLLER__DRONE_CONTROLLER_COMPLETO_HPP_
