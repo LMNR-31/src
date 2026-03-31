@@ -13,7 +13,8 @@ enum class TakeoffFSM { WAIT_FCU, PUBLISH_TAKEOFF, MONITOR };
 class TakeoffNode : public rclcpp::Node
 {
 public:
-  TakeoffNode() : Node("takeoff"), fsm_(TakeoffFSM::WAIT_FCU)
+  TakeoffNode() : Node("takeoff"), fsm_(TakeoffFSM::WAIT_FCU),
+    attempt_start_(rclcpp::Time(0, 0, RCL_ROS_TIME))
   {
     // Parameters
     this->declare_parameter<std::string>("uav_name", "uav1");
@@ -94,7 +95,7 @@ private:
         }
         RCLCPP_INFO(this->get_logger(), "FCU connected. Proceeding to publish takeoff waypoint.");
         fsm_ = TakeoffFSM::PUBLISH_TAKEOFF;
-        break;  // fall through to PUBLISH_TAKEOFF on next tick
+        break;  // will transition to PUBLISH_TAKEOFF on next timer tick
 
       case TakeoffFSM::PUBLISH_TAKEOFF:
         if (use_current_xy_ && !odom_received_) {
