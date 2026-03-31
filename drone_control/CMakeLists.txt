@@ -31,78 +31,13 @@ ament_export_dependencies(rosidl_default_runtime)
 
 # Adicionar no final do arquivo drone_control/CMakeLists.txt:
 
-add_executable(drone_activate_and_go_forward src/drone_activate_and_go_forward.cpp)
 
-ament_target_dependencies(drone_activate_and_go_forward
-  rclcpp
-  geometry_msgs
-  mavros_msgs
-  nav_msgs
-)
 
-install(TARGETS
-  drone_activate_and_go_forward
-  DESTINATION lib/${PROJECT_NAME}
-)
 
-add_executable(drone_soft_land src/drone_soft_land.cpp)
 
-ament_target_dependencies(drone_soft_land
-  rclcpp
-  geometry_msgs
-  mavros_msgs
-  nav_msgs
-)
 
-install(TARGETS drone_soft_land
-  DESTINATION lib/${PROJECT_NAME}
-)
-add_executable(mission_manager src/mission_manager.cpp)
 
-ament_target_dependencies(mission_manager rclcpp mavros_msgs std_msgs)
 
-install(TARGETS
-  mission_manager
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-add_executable(drone_publish_landing_waypoints src/drone_publish_landing_waypoints.cpp)
-
-ament_target_dependencies(drone_publish_landing_waypoints
-  rclcpp
-  geometry_msgs
-  mavros_msgs
-)
-
-install(TARGETS drone_publish_landing_waypoints
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-add_executable(landing_mode_a_land_and_takeoff src/landing_mode_a_land_and_takeoff.cpp)
-
-ament_target_dependencies(landing_mode_a_land_and_takeoff
-  rclcpp
-  geometry_msgs
-  rcl_interfaces
-  nav_msgs
-)
-
-install(TARGETS landing_mode_a_land_and_takeoff
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-add_executable(landing_mode_b_land_and_disarm src/landing_mode_b_land_and_disarm.cpp)
-
-ament_target_dependencies(landing_mode_b_land_and_disarm
-  rclcpp
-  geometry_msgs
-  rcl_interfaces
-  nav_msgs
-)
-
-install(TARGETS landing_mode_b_land_and_disarm
-  DESTINATION lib/${PROJECT_NAME}
-)
 
 add_executable(drone_yaw_360 src/drone_yaw_360.cpp)
 
@@ -124,24 +59,13 @@ install(TARGETS drone_yaw_360
 )
 
 
-# Install Python scripts
-install(PROGRAMS
-  src/camera_viewer.py
-  DESTINATION lib/${PROJECT_NAME}
-  RENAME camera_viewer
-)
+
 
 add_executable(supervisor src/supervisor.cpp)
 ament_target_dependencies(supervisor rclcpp std_msgs geometry_msgs nav_msgs)
 install(TARGETS supervisor DESTINATION lib/${PROJECT_NAME})
 
-add_executable(takeoff_waypoint_publisher_8s src/takeoff_waypoint_publisher_8s.cpp)
-ament_target_dependencies(takeoff_waypoint_publisher_8s
-  rclcpp
-  geometry_msgs
-  nav_msgs
-)
-install(TARGETS takeoff_waypoint_publisher_8s DESTINATION lib/${PROJECT_NAME})
+
 
 add_executable(takeoff src/takeoff.cpp)
 ament_target_dependencies(takeoff
