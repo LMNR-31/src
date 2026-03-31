@@ -156,3 +156,4 @@ Node logs are saved under `/tmp/drone_logs/`. To follow live:
 tail -f /tmp/drone_logs/hover_supervisor_node_*.log
 ```
 # drone_control
+# src
