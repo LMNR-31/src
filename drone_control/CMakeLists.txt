@@ -91,6 +91,10 @@ ament_target_dependencies(missao_P_T
 )
 install(TARGETS missao_P_T DESTINATION lib/${PROJECT_NAME})
 
+add_executable(supervisor_T src/supervisor_T.cpp)
+ament_target_dependencies(supervisor_T rclcpp std_msgs)
+install(TARGETS supervisor_T DESTINATION lib/${PROJECT_NAME})
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
