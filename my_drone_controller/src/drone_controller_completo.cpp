@@ -711,7 +711,7 @@ void DroneControllerCompleto::waypoints_callback(
     return;
   }
 
-  if (msg->poses.size() == 1 && last_z >= config_.land_z_threshold) {
+  if (msg->poses.size() == 1 && last_z >= config_.land_z_threshold && !is_in_flight()) {
     // Guard: do not start a new takeoff while the drone is still ARMED in state 4
     // (DISARM is pending confirmation from the FCU). If the drone is already
     // disarmed, handle_state4_disarm_reset() performs the reset and returns false
@@ -722,21 +722,11 @@ void DroneControllerCompleto::waypoints_callback(
         "Aguardando confirmação de DISARM pelo FCU antes de aceitar novo takeoff.");
       return;
     }
-    // Guard: warn if a new takeoff arrives while the drone is already in flight.
-    // Hipóteses: operador enviou takeoff durante voo (estado 1/2/3) por engano,
-    // ou o sistema de missão reiniciou sem esperar o pouso anterior completar.
-    if (is_in_flight()) {
-      RCLCPP_WARN(this->get_logger(),
-        "⚠️ [TAKEOFF] Novo takeoff recebido enquanto drone em ESTADO %d (em voo). "
-        "Estado inconsistente — reiniciando ciclo de decolagem. "
-        "(Hipótese: missão reenviada antes do pouso ou crash de estado da FSM.)",
-        state_voo_);
-    }
     handle_single_takeoff_waypoint_command(msg->poses[0]);
     return;
   }
 
-  if (msg->poses.size() >= 2) {
+  if (msg->poses.size() >= 2 || (msg->poses.size() == 1 && is_in_flight())) {
     if (state_voo_ == 4) {
       RCLCPP_WARN(this->get_logger(),
         "⚠️ Ignorando waypoints de trajetória durante pouso (estado %d)", state_voo_);
@@ -2033,14 +2023,18 @@ void DroneControllerCompleto::finalize_trajectory_complete()
   progress_msg.data = 100.0;
   progress_publisher_->publish(progress_msg);
 
-  // Enable /mission_waypoints processing now that the trajectory is fully complete.
-  // The supervisor will trigger mission_manager exactly once.
-  mission_enabled_ = true;
+  // Update hover position to the last trajectory waypoint so the drone holds
+  // at the final position when returning to HOVER (state 2).
+  if (!trajectory_waypoints_.empty()) {
+    last_waypoint_goal_.header.stamp = this->now();
+    last_waypoint_goal_.header.frame_id = "map";
+    last_waypoint_goal_.pose = trajectory_waypoints_.back();
+  }
 
   RCLCPP_INFO(this->get_logger(),
     "📢 Trajetória terminada! Publicado /trajectory_finished = true");
   RCLCPP_INFO(this->get_logger(),
-    "🚦 [MISSION] mission_enabled_=true — aguardando /mission_waypoints do supervisor.");
+    "🛸 [HOVER] Trajetória concluída — drone em hover. Aguardando novos /waypoints.");
 }
 
 void DroneControllerCompleto::handle_mission_interrupt_in_state3()
@@ -2209,17 +2203,14 @@ void DroneControllerCompleto::handle_state3_trajectory()
       // Check whether the trajectory is now complete.
       if (current_waypoint_idx_ >= static_cast<int>(trajectory_waypoints_.size())) {
         finalize_trajectory_complete();
-        // Enter WAIT_LAND_WP so the controller accepts the landing waypoints
-        // published by mission_manager (triggered once by the supervisor at
-        // the end of the full trajectory).
+        // Return to HOVER: drone holds at the last waypoint and waits for
+        // new /waypoints. No mission cycle is started (Option B).
         RCLCPP_INFO(this->get_logger(),
-          "🔄 [MISSION WAIT_LAND_WP] Fim de trajetória (WP%d) — missão habilitada. "
-          "Aguardando /mission_waypoints de pouso do supervisor.",
+          "🏁 [HOVER] Trajetória concluída (WP%d) — retornando a ESTADO 2. "
+          "Aguardando novos /waypoints.",
           last_waypoint_reached_idx_);
-        mission_cycle_phase_ = MissionCyclePhase::WAIT_LAND_WP;
-        mission_waypoints_.clear();
-        mission_wp_follow_idx_ = 0;
-        last_published_mission_wp_idx_ = -1;
+        controlador_ativo_ = false;
+        state_voo_ = 2;
         return;
       }
 
