@@ -8,6 +8,7 @@
 #include "mavros_msgs/srv/set_mode.hpp"
 #include "mavros_msgs/srv/command_bool.hpp"
 #include "mavros_msgs/msg/state.hpp"
+#include "mavros_msgs/msg/extended_state.hpp"
 #include "mavros_msgs/msg/position_target.hpp"
 #include "rcl_interfaces/msg/set_parameters_result.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -116,6 +117,10 @@ private:
   // ── Landing / activation helpers ────────────────────────────────────────
   void trigger_landing(double z);
   void activate_offboard_arm_if_needed();
+  /// Returns true when the autopilot (via ExtendedState) reports LANDING or LANDED.
+  /// Only trusted if the message was received within the staleness window and the
+  /// drone is currently armed.
+  bool autopilot_indicates_landing() const;
 
   // ── Pre-ARM setpoint streaming ───────────────────────────────────────────
   /**
@@ -275,6 +280,7 @@ private:
 
   // ── Subscribers ──────────────────────────────────────────────────────────
   rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr state_sub_;
+  rclcpp::Subscription<mavros_msgs::msg::ExtendedState>::SharedPtr extended_state_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr waypoints_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr mission_waypoints_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr waypoint_goal_sub_;
@@ -300,6 +306,12 @@ private:
 
   // ── FCU state ────────────────────────────────────────────────────────────
   mavros_msgs::msg::State current_state_;
+  /// Latest ExtendedState message from /uav1/mavros/extended_state.
+  mavros_msgs::msg::ExtendedState last_extended_state_;
+  /// Timestamp of the last received ExtendedState message (for staleness check).
+  rclcpp::Time last_extended_state_time_{0, 0, RCL_ROS_TIME};
+  /// True once at least one ExtendedState message has been received.
+  bool extended_state_received_{false};
 
   // ── FSM state variables ───────────────────────────────────────────────────
   int state_voo_;   ///< 0=wait, 1=takeoff, 2=hover, 3=trajectory, 4=landing
