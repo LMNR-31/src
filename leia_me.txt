@@ -24,6 +24,7 @@ ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
 poses:
 - position: {x: 0.0, y: 0.0, z: 2.0}
   orientation: {w: 1.0}
+
 # para pouso 
 ros2 run drone_control pouso
 # ou
@@ -33,13 +34,13 @@ ros2 run drone_control pouso --ros-args \
   -p y:=-2.0
   
 #missão pouso e takeoff
-
+ros2 run drone_control missao_P_T
 
 # camera 
 ros2 run drone_control camera_viewer
 
 # supervisor 
-ros2 run drone_control supervisor
+ros2 run drone_control supervisor_T
 
 ros2 topic pub /waypoint_goal geometry_msgs/msg/PoseStamped '{
   header: {frame_id: "map"},
@@ -71,3 +72,18 @@ poses:
   orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
 - position: {x: 6.0, y: 6.0, z: 1.5}
   orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+
+ ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
+  frame_id: map
+poses:
+- position: {x: 0.0, y: 0.0, z: 2.0}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+- position: {x: 3.0, y: 3.0, z: 4.0}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+- position: {x: 6.0, y: 1.0, z: 2.0}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+- position: {x: 7.0, y: 2.0, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+- position: {x: 0.0, y: 0.0, z: 2.0}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+
