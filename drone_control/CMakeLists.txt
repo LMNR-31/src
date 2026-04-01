@@ -28,17 +28,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 
 ament_export_dependencies(rosidl_default_runtime)
 
-
-# Adicionar no final do arquivo drone_control/CMakeLists.txt:
-
-
-
-
-
-
-
-
-
 add_executable(drone_yaw_360 src/drone_yaw_360.cpp)
 
 ament_target_dependencies(drone_yaw_360
@@ -57,15 +46,6 @@ rosidl_target_interfaces(drone_yaw_360
 install(TARGETS drone_yaw_360
   DESTINATION lib/${PROJECT_NAME}
 )
-
-
-
-
-add_executable(supervisor src/supervisor.cpp)
-ament_target_dependencies(supervisor rclcpp std_msgs geometry_msgs nav_msgs)
-install(TARGETS supervisor DESTINATION lib/${PROJECT_NAME})
-
-
 
 add_executable(takeoff src/takeoff.cpp)
 ament_target_dependencies(takeoff

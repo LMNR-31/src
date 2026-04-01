@@ -72,9 +72,9 @@ private:
 
     // ── FASE 2: aguardar 5 s ─────────────────────────────────────────────────
     RCLCPP_INFO(this->get_logger(),
-      "⏳ [FASE 2] Aguardando 5 segundos antes de decolar…");
+      "⏳ [FASE 2] Aguardando 10 segundos antes de decolar…");
 
-    for (int i = 5; i > 0; --i) {
+    for (int i = 10; i > 0; --i) {
       if (stop_requested_.load()) {
         RCLCPP_WARN(this->get_logger(),
           "⚠️  Interrupção solicitada durante espera. Encerrando.");
