@@ -75,23 +75,20 @@ private:
   void imageCallback(const sensor_msgs::msg::Image::ConstSharedPtr &msg,
                      const std::string &topic) {
     try {
-      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                           "Image on %s: %ux%u encoding=%s",
-                           topic.c_str(), msg->width, msg->height,
-                           msg->encoding.c_str());
-
-      auto cv_ptr = cv_bridge::toCvShare(msg, msg->encoding);
-
-      cv::Mat img;
-      if (msg->encoding == "rgb8") {
-        cv::cvtColor(cv_ptr->image, img, cv::COLOR_RGB2BGR);
-      } else {
-        img = cv_ptr->image.clone();
+      if (msg->encoding != "rgb8") {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                             "Unexpected encoding '%s' on %s; expected rgb8 — skipping",
+                             msg->encoding.c_str(), topic.c_str());
+        return;
       }
+
+      // Share the buffer in rgb8 encoding, then clone for thread-safe ownership
+      // (toCvShare borrows the message buffer).
+      auto cv_ptr = cv_bridge::toCvShare(msg, "rgb8");
 
       {
         std::lock_guard<std::mutex> lock(image_mutex_);
-        images_[topic] = std::move(img);
+        images_[topic] = cv_ptr->image.clone(); // store as RGB
       }
     } catch (const cv_bridge::Exception &e) {
       RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
@@ -142,10 +139,14 @@ private:
       cv::Mat resized;
       cv::resize(image, resized, cv::Size(img_width, img_height));
 
+      // Images are stored as RGB; convert to BGR for OpenCV display.
+      cv::Mat resized_bgr;
+      cv::cvtColor(resized, resized_bgr, cv::COLOR_RGB2BGR);
+
       int y_start = row * img_height;
       int x_start = col * img_width;
 
-      resized.copyTo(canvas(cv::Rect(x_start, y_start, img_width, img_height)));
+      resized_bgr.copyTo(canvas(cv::Rect(x_start, y_start, img_width, img_height)));
 
       // Extract camera name from topic (e.g., /uav1/bluefox_down/image_raw ->
       // bluefox_down)
