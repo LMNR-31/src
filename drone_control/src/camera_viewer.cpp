@@ -19,6 +19,7 @@ private:
   int window_width_{1600}, window_height_{900};
   bool running_{false};
   std::thread display_thread_;
+  cv::Mat canvas_;
 
 public:
   CameraViewer() : Node("camera_viewer") {
@@ -53,6 +54,9 @@ public:
       RCLCPP_INFO(this->get_logger(), "Subscribed to: %s", topic.c_str());
     }
 
+    canvas_ = cv::Mat(window_height_, window_width_, CV_8UC3, cv::Scalar(0, 0, 0));
+
+    cv::startWindowThread();
     cv::namedWindow("Drone Cameras", cv::WINDOW_NORMAL);
     cv::resizeWindow("Drone Cameras", window_width_, window_height_);
 
@@ -83,17 +87,15 @@ private:
 
   void displayLoop() {
     while (running_ && rclcpp::ok()) {
-      std::map<std::string, cv::Mat> images_copy;
+      cv::Mat frame;
       {
         std::lock_guard<std::mutex> lock(image_mutex_);
-        if (images_.empty()) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(30));
-          continue;
+        if (!images_.empty()) {
+          canvas_ = createCanvas(images_);
         }
-        images_copy = images_;
+        frame = canvas_;
       }
-      cv::Mat canvas = createCanvas(images_copy);
-      cv::imshow("Drone Cameras", canvas);
+      cv::imshow("Drone Cameras", frame);
       int key = cv::waitKey(30) & 0xFF;
       if (key == 27) { // ESC
         running_ = false;
