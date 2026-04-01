@@ -986,10 +986,13 @@ bool DroneControllerCompleto::check_landing_in_flight(double z)
 {
   if ((state_voo_ == 2 || state_voo_ == 3) && autopilot_indicates_landing()) {
     trigger_landing(z);
+    const uint8_t ls = last_extended_state_.landed_state;
+    const bool is_landing = (ls == mavros_msgs::msg::ExtendedState::LANDED_STATE_LANDING);
     RCLCPP_WARN(this->get_logger(),
-      "🛬 [ID=%lu] POUSO DETECTADO (autopiloto)! landed_state=%d, Z = %.2f m - Comando LAND enfileirado",
+      "🛬 [ID=%lu] POUSO DETECTADO (autopiloto)! landed_state=%d (%s), Z = %.2f m - Comando LAND enfileirado",
       *land_cmd_id_,
-      static_cast<int>(last_extended_state_.landed_state),
+      static_cast<int>(ls),
+      is_landing ? "LANDING" : "ON_GROUND",
       z);
     return true;
   }
@@ -1928,6 +1931,20 @@ void DroneControllerCompleto::handle_state2_hover()
     return;
   }
 
+  // Detect landing from autopilot signal during HOVER (e.g. after trajectory
+  // completes at a landing waypoint above the initial takeoff altitude).
+  if (autopilot_indicates_landing()) {
+    const uint8_t ls = last_extended_state_.landed_state;
+    const bool is_landing = (ls == mavros_msgs::msg::ExtendedState::LANDED_STATE_LANDING);
+    RCLCPP_WARN(this->get_logger(),
+      "🛬 [HOVER] POUSO DETECTADO (autopiloto)! landed_state=%d (%s), Z = %.2f m - Transitando para STATE 4",
+      static_cast<int>(ls),
+      is_landing ? "LANDING" : "ON_GROUND",
+      current_z_real_);
+    trigger_landing(current_z_real_);
+    return;
+  }
+
   if (controlador_ativo_) {
     state_voo_ = 3;
     RCLCPP_INFO(this->get_logger(), "✈️ Iniciando execução de trajetória...\n");
@@ -1947,9 +1964,12 @@ bool DroneControllerCompleto::detect_and_handle_landing_in_trajectory()
 {
   if (!autopilot_indicates_landing()) { return false; }
 
+  const uint8_t ls = last_extended_state_.landed_state;
+  const bool is_landing = (ls == mavros_msgs::msg::ExtendedState::LANDED_STATE_LANDING);
   RCLCPP_WARN(this->get_logger(),
-    "\n🛬🛬🛬 POUSO DETECTADO DURANTE TRAJETÓRIA (autopiloto)! landed_state=%d, Z = %.2f m",
-    static_cast<int>(last_extended_state_.landed_state),
+    "\n🛬🛬🛬 POUSO DETECTADO DURANTE TRAJETÓRIA (autopiloto)! landed_state=%d (%s), Z = %.2f m",
+    static_cast<int>(ls),
+    is_landing ? "LANDING" : "ON_GROUND",
     current_z_real_);
 
   if (trajectory_cmd_id_) {
@@ -2160,7 +2180,8 @@ void DroneControllerCompleto::handle_mission_interrupt_in_state3()
     }
   }
   // When at the last mission waypoint the existing landing-detection logic in
-  // detect_and_handle_landing_in_trajectory() will fire once z < land_z_threshold.
+  // detect_and_handle_landing_in_trajectory() will fire when the autopilot
+  // reports LANDING (4) or ON_GROUND (1).
 }
 
 void DroneControllerCompleto::handle_state3_trajectory()
