@@ -44,7 +44,7 @@ enum class MissionFSM {
   WAIT_ODOM,
   TAKEOFF,
   MONITOR_TAKEOFF,
-  WAIT_5S,
+  WAIT_BETWEEN_PHASES,   // configurable via wait_sec (default 5 s)
   POUSO,
   MONITOR_LANDING,
   DONE
@@ -88,6 +88,7 @@ public:
     double rate_hz   = this->get_parameter("rate_hz").as_double();
 
     if (altitude_thresh_ < 0.0) {
+      // 0.3 m below target gives sensor-noise tolerance; floor at 0.2 m for safety
       altitude_thresh_ = std::max(takeoff_alt_ - 0.3, 0.2);
     }
 
@@ -169,7 +170,7 @@ private:
         monitorTakeoff();
         break;
 
-      case MissionFSM::WAIT_5S:
+      case MissionFSM::WAIT_BETWEEN_PHASES:
         waitBetweenPhases();
         break;
 
@@ -224,7 +225,7 @@ private:
         "Aguardando %.1f s antes do pouso…",
         current_z_, wait_sec_);
       phase_start_ = this->now();
-      fsm_         = MissionFSM::WAIT_5S;
+      fsm_         = MissionFSM::WAIT_BETWEEN_PHASES;
       return;
     }
 
@@ -304,10 +305,10 @@ private:
   void monitorLanding()
   {
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "[missao_P_T] ⬇️  Descendo… Z=%.2f m (alvo≤%.2f m)",
+      "[missao_P_T] ⬇️  Descendo… Z=%.2f m (alvo≤%.2f m, tolerância 0.15 m)",
       current_z_, landing_z_ + 0.15);
 
-    if (current_z_ <= landing_z_ + 0.15) {
+    if (current_z_ <= landing_z_ + 0.15) {  // 0.15 m tolerance matches pouso.cpp
       RCLCPP_INFO(this->get_logger(),
         "[missao_P_T] ✅ Missão concluída: pouso em Z=%.2f m. Encerrando.",
         current_z_);
