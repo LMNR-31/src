@@ -85,6 +85,12 @@ ament_target_dependencies(pouso
 )
 install(TARGETS pouso DESTINATION lib/${PROJECT_NAME})
 
+add_executable(missao_P_T src/missao_P_T.cpp)
+ament_target_dependencies(missao_P_T
+  rclcpp
+)
+install(TARGETS missao_P_T DESTINATION lib/${PROJECT_NAME})
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
