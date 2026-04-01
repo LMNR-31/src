@@ -135,6 +135,14 @@ void DroneControllerCompleto::setup_subscribers()
     "/uav1/mavros/state", 10,
     [this](const mavros_msgs::msg::State::SharedPtr msg) { current_state_ = *msg; });
 
+  extended_state_sub_ = this->create_subscription<mavros_msgs::msg::ExtendedState>(
+    "/uav1/mavros/extended_state", 10,
+    [this](const mavros_msgs::msg::ExtendedState::SharedPtr msg) {
+      last_extended_state_ = *msg;
+      last_extended_state_time_ = this->now();
+      extended_state_received_ = true;
+    });
+
   waypoints_sub_ = this->create_subscription<geometry_msgs::msg::PoseArray>(
     "/waypoints", 1,
     std::bind(&DroneControllerCompleto::waypoints_callback, this, std::placeholders::_1));
@@ -168,8 +176,9 @@ void DroneControllerCompleto::setup_subscribers()
     std::bind(&DroneControllerCompleto::mission_interrupt_done_callback, this, std::placeholders::_1));
 
   RCLCPP_INFO(this->get_logger(),
-    "✓ Subscribers criados: /uav1/mavros/state, /waypoints, /mission_waypoints, /waypoint_goal, "
-    "odometria, /uav1/yaw_override/cmd, /waypoint_goal_4d, /waypoints_4d e /mission_interrupt_done");
+    "✓ Subscribers criados: /uav1/mavros/state, /uav1/mavros/extended_state, /waypoints, "
+    "/mission_waypoints, /waypoint_goal, odometria, /uav1/yaw_override/cmd, "
+    "/waypoint_goal_4d, /waypoints_4d e /mission_interrupt_done");
 }
 
 void DroneControllerCompleto::setup_services()
@@ -953,13 +962,35 @@ void DroneControllerCompleto::mission_waypoints_callback(
 // SHARED WAYPOINT-GOAL HELPERS
 // ============================================================
 
+bool DroneControllerCompleto::autopilot_indicates_landing() const
+{
+  // Only trust if we have ever received the message
+  if (!extended_state_received_) { return false; }
+
+  // Only trust if the message is fresh (within 1 second)
+  const double age_s = (this->now() - last_extended_state_time_).seconds();
+  if (age_s > 1.0) { return false; }
+
+  // Only trigger when the drone is armed (avoids false positives on the ground)
+  if (!current_state_.armed) { return false; }
+
+  // Trigger when autopilot reports LANDING or LANDED
+  // LANDED_STATE_LANDING (4) = autopilot is actively descending to land
+  // LANDED_STATE_ON_GROUND (1) = autopilot confirms vehicle is on the ground
+  const uint8_t ls = last_extended_state_.landed_state;
+  return (ls == mavros_msgs::msg::ExtendedState::LANDED_STATE_LANDING ||
+          ls == mavros_msgs::msg::ExtendedState::LANDED_STATE_ON_GROUND);
+}
+
 bool DroneControllerCompleto::check_landing_in_flight(double z)
 {
-  if ((state_voo_ == 2 || state_voo_ == 3) && z < config_.land_z_threshold) {
+  if ((state_voo_ == 2 || state_voo_ == 3) && autopilot_indicates_landing()) {
     trigger_landing(z);
     RCLCPP_WARN(this->get_logger(),
-      "🛬 [ID=%lu] POUSO DETECTADO! Z = %.2f m - Comando LAND enfileirado",
-      *land_cmd_id_, z);
+      "🛬 [ID=%lu] POUSO DETECTADO (autopiloto)! landed_state=%d, Z = %.2f m - Comando LAND enfileirado",
+      *land_cmd_id_,
+      static_cast<int>(last_extended_state_.landed_state),
+      z);
     return true;
   }
   return false;
@@ -1914,10 +1945,12 @@ void DroneControllerCompleto::handle_state2_hover()
 
 bool DroneControllerCompleto::detect_and_handle_landing_in_trajectory()
 {
-  if (current_z_real_ >= config_.land_z_threshold) { return false; }
+  if (!autopilot_indicates_landing()) { return false; }
 
   RCLCPP_WARN(this->get_logger(),
-    "\n🛬🛬🛬 POUSO DETECTADO DURANTE TRAJETÓRIA! Z = %.2f m", current_z_real_);
+    "\n🛬🛬🛬 POUSO DETECTADO DURANTE TRAJETÓRIA (autopiloto)! landed_state=%d, Z = %.2f m",
+    static_cast<int>(last_extended_state_.landed_state),
+    current_z_real_);
 
   if (trajectory_cmd_id_) {
     cmd_queue_.confirm(*trajectory_cmd_id_, false);
