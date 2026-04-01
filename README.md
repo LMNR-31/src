@@ -175,6 +175,43 @@ ros2 run drone_control pouso --ros-args \
 
 ---
 
+## `missao_P_T` — Land then Take Off (Pouso → 5 s → Takeoff)
+
+The `missao_P_T` node (Portuguese: *mission P-T*) orchestrates a full
+**land-and-relaunch** sequence:
+
+1. **pouso** — commands the drone to land at the current (or specified) XY
+   position via `my_drone_controller`.
+2. **Wait 5 seconds** — allows time for the drone to disarm / settle.
+3. **takeoff** — takes the drone back to its configured altitude.
+
+If `pouso` fails (non-zero exit code), the node logs an error and **does not
+proceed** with `takeoff` (fail-safe).
+
+### Quick start
+
+```bash
+ros2 run drone_control missao_P_T
+```
+
+### Behaviour
+
+| Phase | Action |
+|-------|--------|
+| FASE 1 | Runs `ros2 run drone_control pouso` and waits for it to complete |
+| FASE 2 | Waits exactly **5 seconds** |
+| FASE 3 | Runs `ros2 run drone_control takeoff` (only if FASE 1 succeeded) |
+
+### Notes
+
+- `missao_P_T` runs `pouso` and `takeoff` with their **default parameters**. To
+  customise landing position, altitude, UAV name, etc., run those nodes
+  individually using their `--ros-args` options; use `missao_P_T` for the
+  automated default-parameter sequence.
+- The node exits automatically after the sequence completes.
+
+---
+
 ## Key Parameters
 
 ### `lpv_mpc_drone_node`
