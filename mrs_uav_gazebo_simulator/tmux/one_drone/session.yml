@@ -32,7 +32,7 @@ windows:
       panes:
         # world_file:=/home/lmnr31/ros2_ws/src/arena_2025_desenho/my_arena.world
         # --enable-realsense-down --enable-realsense-front
-        - ros2 launch mrs_uav_gazebo_simulator simulation.launch.py  gz_headless:=false gz_verbose:=true
+        - ros2 launch mrs_uav_gazebo_simulator simulation.launch.py  world_file:=/home/lmnr31/ros2_ws/src/arena_2025_desenho/my_arena.world gz_headless:=false gz_verbose:=true
         - |
           waitForGazebo; sleep 5
           ros2 service call /mrs_drone_spawner/spawn mrs_msgs/srv/String "{value: '1 --$UAV_TYPE --enable-realsense-down --enable-realsense-front --enable-rangefinder  --pos -0.85 0.70 1 1.57'}"

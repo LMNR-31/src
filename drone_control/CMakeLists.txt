@@ -17,6 +17,11 @@ find_package(tf2 REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(image_transport REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(OpenCV REQUIRED)
+find_package(rosidl_cmake REQUIRED)
+find_package(cv_bridge REQUIRED)
 
 # Generate custom messages
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -70,6 +75,25 @@ ament_target_dependencies(missao_P_T
   rclcpp
 )
 install(TARGETS missao_P_T DESTINATION lib/${PROJECT_NAME})
+
+add_executable(camera_viewer src/camera_viewer.cpp)
+
+ament_target_dependencies(camera_viewer
+  rclcpp
+  sensor_msgs
+  image_transport
+  cv_bridge
+)
+
+target_link_libraries(camera_viewer
+  ${OpenCV_LIBRARIES}
+)
+
+install(TARGETS
+  camera_viewer
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 
 add_executable(supervisor_T src/supervisor_T.cpp)
 ament_target_dependencies(supervisor_T rclcpp std_msgs)
