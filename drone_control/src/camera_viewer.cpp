@@ -75,13 +75,28 @@ private:
   void imageCallback(const sensor_msgs::msg::Image::ConstSharedPtr &msg,
                      const std::string &topic) {
     try {
-      cv::Mat cv_image = cv_bridge::toCvCopy(msg, "bgr8")->image;
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                           "Image on %s: %ux%u encoding=%s",
+                           topic.c_str(), msg->width, msg->height,
+                           msg->encoding.c_str());
+
+      auto cv_ptr = cv_bridge::toCvShare(msg, msg->encoding);
+
+      cv::Mat img;
+      if (msg->encoding == "rgb8") {
+        cv::cvtColor(cv_ptr->image, img, cv::COLOR_RGB2BGR);
+      } else {
+        img = cv_ptr->image.clone();
+      }
+
       {
         std::lock_guard<std::mutex> lock(image_mutex_);
-        images_[topic] = std::move(cv_image);
+        images_[topic] = std::move(img);
       }
-    } catch (cv_bridge::Exception &e) {
+    } catch (const cv_bridge::Exception &e) {
       RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
+    } catch (const std::exception &e) {
+      RCLCPP_ERROR(this->get_logger(), "imageCallback exception: %s", e.what());
     }
   }
 
