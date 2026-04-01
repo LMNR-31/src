@@ -1,17 +1,22 @@
-// supervisor_T.cpp — ROS 2 node that launches missao_P_T each time a
-// trajectory finishes, and resets automatically so it fires again for the
-// next trajectory.
+// supervisor_T.cpp — ROS 2 supervisor node.
 //
-// Detection logic (mirrors supervisor.cpp):
-//   • /trajectory_finished == true    → trajectory done
-//   • /trajectory_progress >= 100     → trajectory done
-//   • /trajectory_finished == false   → new trajectory started, reset guards
-//   • /trajectory_progress  <  99.9   → new trajectory started, reset guards
+// State machine:
+//   INIT        → Forks takeoff process on startup.
+//   TAKING_OFF  → Waits (via WNOHANG poll) for the takeoff process to exit.
+//   WAIT_TRAJ   → Monitors /trajectory_progress and /trajectory_finished;
+//                 transitions to RUN_MISSION when a trajectory completes.
+//   RUN_MISSION → Forks missao_P_T, waits for it to exit, then loops back
+//                 to WAIT_TRAJ for the next cycle (infinite loop).
+//
+// Trajectory-detection logic (WAIT_TRAJ only):
+//   • /trajectory_progress < 99.9  → new trajectory in progress (reset guards)
+//   • /trajectory_progress >= 100  → trajectory done
+//   • /trajectory_finished == false → new trajectory started (reset guards)
+//   • /trajectory_finished == true  → trajectory done
 //     (99.9 threshold avoids spurious resets from float jitter near 100.0)
 //
-// Launch pattern: fork() + execlp("ros2", ...) identical to supervisor.cpp.
-// Only one instance of missao_P_T runs at a time; extras are queued.
-// Child processes are reaped via WNOHANG to prevent zombies.
+// All child processes are spawned via fork()/execlp() and reaped with
+// waitpid(WNOHANG) inside the FSM timer to keep the executor unblocked.
 //
 // Usage:
 //   ros2 run drone_control supervisor_T
@@ -24,16 +29,22 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <memory>
-#include <queue>
+// ── State machine states ───────────────────────────────────────────────────
+enum class SupervisorState {
+    INIT,         // Initial state: will fire takeoff immediately
+    TAKING_OFF,   // Takeoff process is running; waiting for it to exit
+    WAIT_TRAJ,    // Waiting for a trajectory to start and then complete
+    RUN_MISSION,  // missao_P_T is running; waiting for it to exit
+};
 
 class SupervisorTNode : public rclcpp::Node {
 public:
     SupervisorTNode()
     : Node("supervisor_T"),
-      missao_pid_(-1),
-      trajectory_done_received_(false),
-      trajectory_active_(false)
+      state_(SupervisorState::INIT),
+      child_pid_(-1),
+      trajectory_active_(false),
+      trajectory_done_(false)
     {
         progress_sub_ = this->create_subscription<std_msgs::msg::Float32>(
             "/trajectory_progress", 10,
@@ -43,136 +54,205 @@ public:
             "/trajectory_finished", 10,
             std::bind(&SupervisorTNode::finished_callback, this, std::placeholders::_1));
 
-        // Periodic timer: reap finished missao_P_T and drain the launch queue.
-        queue_timer_ = this->create_wall_timer(
+        // Main FSM timer — runs every 500 ms, never blocks the executor.
+        fsm_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(500),
-            std::bind(&SupervisorTNode::process_queue, this));
+            std::bind(&SupervisorTNode::fsm_tick, this));
 
         RCLCPP_INFO(this->get_logger(),
-            "supervisor_T iniciado — monitorando /trajectory_progress e "
-            "/trajectory_finished; missao_P_T será disparado a cada término de trajetória.");
+            "supervisor_T iniciado — executando takeoff automático e iniciando "
+            "missao_P_T em ciclos infinitos após cada trajetória.");
     }
 
 private:
-    // ── Helpers ────────────────────────────────────────────────────────────
-    void on_trajectory_started() {
-        if (!trajectory_active_) {
-            trajectory_active_       = true;
-            trajectory_done_received_ = false;
-            RCLCPP_INFO(this->get_logger(),
-                "▶️  Nova trajetória detectada — guardas resetados, aguardando conclusão.");
-        }
-    }
-
-    void on_trajectory_finished() {
-        if (!trajectory_done_received_) {
-            trajectory_done_received_ = true;
-            pending_queue_.push(true);   // token indicating a pending launch
-            RCLCPP_INFO(this->get_logger(),
-                "🏁 Trajetória concluída — missao_P_T enfileirado (fila=%zu).",
-                pending_queue_.size());
-        }
-    }
-
-    // ── /trajectory_progress callback ─────────────────────────────────────
-    // NOTE: all callbacks and the queue timer share the same single-threaded
-    // executor, so there is no concurrent access to the state variables.
+    // ── /trajectory_progress callback (active only in WAIT_TRAJ) ──────────
     void progress_callback(const std_msgs::msg::Float32::SharedPtr msg) {
-        if (msg->data < 99.9f) {
-            // Progress < 99.9 → a trajectory is running (or a new one just started).
-            // Using 99.9 instead of 100.0 to avoid spurious resets from floating-point
-            // values that hover just below the completion threshold.
-            on_trajectory_started();
-        } else {
-            // Progress >= 100 → trajectory finished.
-            RCLCPP_INFO(this->get_logger(),
-                "📊 Progresso %.1f%% recebido — trajetória concluída.", msg->data);
-            on_trajectory_finished();
-        }
-    }
-
-    // ── /trajectory_finished callback ──────────────────────────────────────
-    void finished_callback(const std_msgs::msg::Bool::SharedPtr msg) {
-        if (!msg->data) {
-            // False → new trajectory starting; reset so we can fire again.
-            on_trajectory_started();
-        } else {
-            // True → trajectory finished.
-            RCLCPP_INFO(this->get_logger(),
-                "📨 /trajectory_finished=true recebido — trajetória concluída.");
-            on_trajectory_finished();
-        }
-    }
-
-    // ── Periodic: reap finished process, launch next from queue ───────────
-    void process_queue() {
-        // Reap the previous missao_P_T if it has finished.
-        if (missao_pid_ > 0) {
-            int status = 0;
-            pid_t result = waitpid(missao_pid_, &status, WNOHANG);
-            if (result == missao_pid_) {
-                if (WIFEXITED(status)) {
-                    RCLCPP_INFO(this->get_logger(),
-                        "✅ missao_P_T (PID %d) finalizado com código %d.",
-                        static_cast<int>(missao_pid_), WEXITSTATUS(status));
-                } else {
-                    RCLCPP_WARN(this->get_logger(),
-                        "⚠️  missao_P_T (PID %d) encerrou de forma anormal.",
-                        static_cast<int>(missao_pid_));
-                }
-                missao_pid_ = -1;
-            } else if (result < 0) {
-                // Process no longer exists (already reaped or invalid).
-                missao_pid_ = -1;
-            } else {
-                // Still running; do not launch another instance yet.
-                return;
-            }
-        }
-
-        // Nothing queued — nothing to do.
-        if (pending_queue_.empty()) {
+        if (state_ != SupervisorState::WAIT_TRAJ) {
             return;
         }
+        if (msg->data < 99.9f) {
+            // Trajectory is in progress; set active and reset done guard.
+            if (!trajectory_active_) {
+                trajectory_active_ = true;
+                trajectory_done_   = false;
+                RCLCPP_INFO(this->get_logger(),
+                    "▶️  [WAIT_TRAJ] Nova trajetória detectada (%.1f%%) — aguardando conclusão.",
+                    msg->data);
+            }
+        } else {
+            // Progress >= 100 → trajectory finished.
+            if (!trajectory_done_) {
+                trajectory_active_ = true;   // ensure guard is consistent
+                trajectory_done_   = true;
+                RCLCPP_INFO(this->get_logger(),
+                    "📊 [WAIT_TRAJ] Progresso %.1f%% — trajetória concluída.", msg->data);
+            }
+        }
+    }
 
-        pending_queue_.pop();
+    // ── /trajectory_finished callback (active only in WAIT_TRAJ) ──────────
+    void finished_callback(const std_msgs::msg::Bool::SharedPtr msg) {
+        if (state_ != SupervisorState::WAIT_TRAJ) {
+            return;
+        }
+        if (!msg->data) {
+            // false → a new trajectory is starting; reset done guard.
+            if (!trajectory_active_) {
+                trajectory_active_ = true;
+                trajectory_done_   = false;
+                RCLCPP_INFO(this->get_logger(),
+                    "▶️  [WAIT_TRAJ] Nova trajetória detectada (/trajectory_finished=false) — "
+                    "aguardando conclusão.");
+            }
+        } else {
+            // true → trajectory finished.
+            if (!trajectory_done_) {
+                trajectory_active_ = true;   // ensure guard is consistent
+                trajectory_done_   = true;
+                RCLCPP_INFO(this->get_logger(),
+                    "📨 [WAIT_TRAJ] /trajectory_finished=true — trajetória concluída.");
+            }
+        }
+    }
 
+    // ── Main FSM tick (every 500 ms) ───────────────────────────────────────
+    void fsm_tick() {
+        switch (state_) {
+            case SupervisorState::INIT:
+                do_init();
+                break;
+            case SupervisorState::TAKING_OFF:
+                check_takeoff();
+                break;
+            case SupervisorState::WAIT_TRAJ:
+                check_trajectory();
+                break;
+            case SupervisorState::RUN_MISSION:
+                check_mission();
+                break;
+        }
+    }
+
+    // ── INIT: fork takeoff and transition to TAKING_OFF ───────────────────
+    void do_init() {
         RCLCPP_INFO(this->get_logger(),
-            "🚀 [SUPERVISOR_T] Lançando missao_P_T…");
-
-        pid_t pid = fork();
-        if (pid == 0) {
-            // Child: exec missao_P_T.
-            execlp("ros2", "ros2", "run", "drone_control", "missao_P_T",
-                   static_cast<char*>(nullptr));
-            // exec failed
-            _exit(1);
-        } else if (pid > 0) {
-            missao_pid_ = pid;
+            "[INIT] 🛫 Disparando takeoff automático (ros2 run drone_control takeoff)…");
+        child_pid_ = fork_exec("takeoff");
+        if (child_pid_ > 0) {
             RCLCPP_INFO(this->get_logger(),
-                "missao_P_T iniciado (PID %d).", static_cast<int>(pid));
+                "[INIT] takeoff iniciado (PID %d). Aguardando conclusão…",
+                static_cast<int>(child_pid_));
+            state_ = SupervisorState::TAKING_OFF;
         } else {
             RCLCPP_ERROR(this->get_logger(),
-                "fork() falhou ao iniciar missao_P_T!");
+                "[INIT] fork() falhou ao iniciar takeoff! Tentando novamente em 500 ms…");
         }
+    }
 
-        // After launching, mark trajectory as inactive so the next
-        // trajectory-started signal properly resets guards.
+    // ── TAKING_OFF: poll until takeoff process exits ───────────────────────
+    void check_takeoff() {
+        int status = 0;
+        pid_t result = waitpid(child_pid_, &status, WNOHANG);
+        if (result == 0) {
+            // Still running.
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[TAKING_OFF] Aguardando takeoff (PID %d)…",
+                static_cast<int>(child_pid_));
+            return;
+        }
+        if (result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            RCLCPP_INFO(this->get_logger(),
+                "[TAKING_OFF] ✅ Takeoff concluído com sucesso.");
+        } else {
+            RCLCPP_WARN(this->get_logger(),
+                "[TAKING_OFF] ⚠️  Takeoff encerrou (código=%d). Continuando para WAIT_TRAJ.",
+                WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        }
+        child_pid_ = -1;
+        reset_trajectory_guards();
+        state_ = SupervisorState::WAIT_TRAJ;
+        RCLCPP_INFO(this->get_logger(),
+            "[WAIT_TRAJ] Monitorando /trajectory_progress e /trajectory_finished…");
+    }
+
+    // ── WAIT_TRAJ: wait for a complete trajectory, then launch mission ─────
+    void check_trajectory() {
+        if (!trajectory_done_) {
+            return;
+        }
+        RCLCPP_INFO(this->get_logger(),
+            "[WAIT_TRAJ] 🏁 Trajetória concluída — lançando missao_P_T…");
+        child_pid_ = fork_exec("missao_P_T");
+        if (child_pid_ > 0) {
+            reset_trajectory_guards();
+            state_ = SupervisorState::RUN_MISSION;
+            RCLCPP_INFO(this->get_logger(),
+                "[RUN_MISSION] missao_P_T iniciado (PID %d).",
+                static_cast<int>(child_pid_));
+        } else {
+            RCLCPP_ERROR(this->get_logger(),
+                "[WAIT_TRAJ] fork() falhou ao iniciar missao_P_T! Tentando novamente em 500 ms…");
+            // Keep trajectory_done_ set so the next tick retries.
+        }
+    }
+
+    // ── RUN_MISSION: poll until missao_P_T exits, then loop ───────────────
+    void check_mission() {
+        int status = 0;
+        pid_t result = waitpid(child_pid_, &status, WNOHANG);
+        if (result == 0) {
+            // Still running.
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[RUN_MISSION] Aguardando missao_P_T (PID %d)…",
+                static_cast<int>(child_pid_));
+            return;
+        }
+        if (result > 0 && WIFEXITED(status)) {
+            RCLCPP_INFO(this->get_logger(),
+                "[RUN_MISSION] ✅ missao_P_T (PID %d) finalizado com código %d.",
+                static_cast<int>(child_pid_), WEXITSTATUS(status));
+        } else {
+            RCLCPP_WARN(this->get_logger(),
+                "[RUN_MISSION] ⚠️  missao_P_T (PID %d) encerrou de forma anormal.",
+                static_cast<int>(child_pid_));
+        }
+        child_pid_ = -1;
+        reset_trajectory_guards();
+        state_ = SupervisorState::WAIT_TRAJ;
+        RCLCPP_INFO(this->get_logger(),
+            "[WAIT_TRAJ] missao_P_T concluído. Aguardando próxima trajetória…");
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+    pid_t fork_exec(const char * executable) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            // Child process: exec the target node.
+            execlp("ros2", "ros2", "run", "drone_control", executable,
+                   static_cast<char *>(nullptr));
+            // execlp only returns on failure.
+            _exit(1);
+        }
+        return pid;   // > 0 in parent on success; -1 on fork failure
+    }
+
+    void reset_trajectory_guards() {
         trajectory_active_ = false;
+        trajectory_done_   = false;
     }
 
     // ── Members ────────────────────────────────────────────────────────────
     rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr progress_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr    finished_sub_;
-    rclcpp::TimerBase::SharedPtr                            queue_timer_;
+    rclcpp::TimerBase::SharedPtr                            fsm_timer_;
 
-    pid_t              missao_pid_;            // PID of running missao_P_T (-1 if none)
-    bool               trajectory_done_received_;  // guard: fire once per trajectory
-    bool               trajectory_active_;         // true while a trajectory is in progress
-    std::queue<bool>   pending_queue_;             // pending launches (token queue)
+    SupervisorState state_;
+    pid_t           child_pid_;       // PID of current child process (-1 if none)
+    bool            trajectory_active_;   // true while a trajectory is in progress
+    bool            trajectory_done_;     // true when trajectory completion confirmed
 };
 
-int main(int argc, char **argv) {
+int main(int argc, char ** argv) {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<SupervisorTNode>();
     rclcpp::spin(node);
