@@ -733,8 +733,22 @@ void DroneControllerCompleto::waypoints_callback(
       return;
     }
 
-    RCLCPP_INFO(this->get_logger(), "🔍 Trajetória (2+ waypoints) recebida");
-    RCLCPP_INFO(this->get_logger(), "   state_voo_=%d (esperado 2 para ativar)", state_voo_);
+    // Detect landing-descent trajectories published by missao_P_T's pouso
+    // sub-process: exactly 2 waypoints where the last one is below the landing
+    // threshold.  Their detailed log is suppressed to DEBUG level so the
+    // terminal is not flooded during the automated mission cycle.
+    const bool is_landing_descent =
+      (msg->poses.size() == 2 &&
+       msg->poses.back().position.z < config_.land_z_threshold);
+
+    if (is_landing_descent) {
+      RCLCPP_DEBUG(this->get_logger(),
+        "🔍 Trajetória de descida recebida (z_final=%.2fm) — log detalhado suprimido.",
+        msg->poses.back().position.z);
+    } else {
+      RCLCPP_INFO(this->get_logger(), "🔍 Trajetória (2+ waypoints) recebida");
+      RCLCPP_INFO(this->get_logger(), "   state_voo_=%d (esperado 2 para ativar)", state_voo_);
+    }
 
     trajectory_waypoints_ = msg->poses;
     trajectory_yaws_.clear();
@@ -750,17 +764,23 @@ void DroneControllerCompleto::waypoints_callback(
     // New trajectory: disable mission gate until this trajectory finishes.
     if (mission_enabled_) {
       mission_enabled_ = false;
-      RCLCPP_INFO(this->get_logger(),
-        "🔒 [MISSION] Nova trajetória recebida — mission_enabled_=false. "
-        "/mission_waypoints será ignorado durante a execução.");
+      if (!is_landing_descent) {
+        RCLCPP_INFO(this->get_logger(),
+          "🔒 [MISSION] Nova trajetória recebida — mission_enabled_=false. "
+          "/mission_waypoints será ignorado durante a execução.");
+      }
     }
 
-    log_trajectory_waypoints_3d(trajectory_waypoints_);
+    if (!is_landing_descent) {
+      log_trajectory_waypoints_3d(trajectory_waypoints_);
+    }
     publish_waypoints_status();
 
     if (state_voo_ != 2) {
-      RCLCPP_INFO(this->get_logger(),
-        "⏸️ Trajetória armazenada - Será ativada quando drone chegar em HOVER (ESTADO 2)");
+      if (!is_landing_descent) {
+        RCLCPP_INFO(this->get_logger(),
+          "⏸️ Trajetória armazenada - Será ativada quando drone chegar em HOVER (ESTADO 2)");
+      }
       controlador_ativo_ = false;
       pouso_em_andamento_ = false;
       return;

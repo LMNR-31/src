@@ -15,6 +15,14 @@
 //   • /trajectory_finished == true  → trajectory done
 //     (99.9 threshold avoids spurious resets from float jitter near 100.0)
 //
+// Stale-signal protection (post_reset_ticks_):
+//   When transitioning from TAKING_OFF or RUN_MISSION to WAIT_TRAJ the
+//   subscription queues may still hold trajectory signals that were published
+//   by missao_P_T's pouso sub-process while the supervisor was in RUN_MISSION.
+//   post_reset_ticks_ is set to POST_RESET_COOLDOWN_TICKS on every such
+//   transition.  check_trajectory() discards any signals that arrive during
+//   those ticks, preventing a spurious re-launch of missao_P_T.
+//
 // All child processes are spawned via fork()/execlp() and reaped with
 // waitpid(WNOHANG) inside the FSM timer to keep the executor unblocked.
 //
@@ -37,6 +45,13 @@ enum class SupervisorState {
     RUN_MISSION,  // missao_P_T is running; waiting for it to exit
 };
 
+// Number of FSM ticks (× 500 ms each = 1 s total) to ignore trajectory
+// signals after entering WAIT_TRAJ.  This discards any stale messages that
+// were queued while the supervisor was in RUN_MISSION (e.g. signals generated
+// by missao_P_T's pouso sub-trajectory) before the supervisor starts
+// listening for the next real external trajectory.
+static constexpr int POST_RESET_COOLDOWN_TICKS = 2;
+
 class SupervisorTNode : public rclcpp::Node {
 public:
     SupervisorTNode()
@@ -44,7 +59,8 @@ public:
       state_(SupervisorState::INIT),
       child_pid_(-1),
       trajectory_active_(false),
-      trajectory_done_(false)
+      trajectory_done_(false),
+      post_reset_ticks_(0)
     {
         progress_sub_ = this->create_subscription<std_msgs::msg::Float32>(
             "/trajectory_progress", 10,
@@ -170,6 +186,7 @@ private:
         }
         child_pid_ = -1;
         reset_trajectory_guards();
+        post_reset_ticks_ = POST_RESET_COOLDOWN_TICKS;
         state_ = SupervisorState::WAIT_TRAJ;
         RCLCPP_INFO(this->get_logger(),
             "[WAIT_TRAJ] Monitorando /trajectory_progress e /trajectory_finished…");
@@ -177,6 +194,19 @@ private:
 
     // ── WAIT_TRAJ: wait for a complete trajectory, then launch mission ─────
     void check_trajectory() {
+        // Discard any stale signals that were queued while in RUN_MISSION
+        // (e.g. trajectory_finished=true from missao_P_T's pouso sub-process).
+        if (post_reset_ticks_ > 0) {
+            --post_reset_ticks_;
+            if (trajectory_active_ || trajectory_done_) {
+                RCLCPP_INFO(this->get_logger(),
+                    "[WAIT_TRAJ] Sinais residuais de missao_P_T descartados "
+                    "(cooldown: %d tick(s) restante(s)).",
+                    post_reset_ticks_);
+                reset_trajectory_guards();
+            }
+            return;
+        }
         if (!trajectory_done_) {
             return;
         }
@@ -218,6 +248,7 @@ private:
         }
         child_pid_ = -1;
         reset_trajectory_guards();
+        post_reset_ticks_ = POST_RESET_COOLDOWN_TICKS;
         state_ = SupervisorState::WAIT_TRAJ;
         RCLCPP_INFO(this->get_logger(),
             "[WAIT_TRAJ] missao_P_T concluído. Aguardando próxima trajetória…");
@@ -247,9 +278,10 @@ private:
     rclcpp::TimerBase::SharedPtr                            fsm_timer_;
 
     SupervisorState state_;
-    pid_t           child_pid_;       // PID of current child process (-1 if none)
+    pid_t           child_pid_;           // PID of current child process (-1 if none)
     bool            trajectory_active_;   // true while a trajectory is in progress
     bool            trajectory_done_;     // true when trajectory completion confirmed
+    int             post_reset_ticks_;    // cooldown ticks remaining after entering WAIT_TRAJ
 };
 
 int main(int argc, char ** argv) {
