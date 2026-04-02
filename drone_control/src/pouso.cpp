@@ -22,6 +22,7 @@
 #include <geometry_msgs/msg/pose.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <mavros_msgs/msg/state.hpp>
+#include <mavros_msgs/srv/set_mode.hpp>
 #include <chrono>
 
 using namespace std::chrono_literals;
@@ -58,6 +59,9 @@ public:
 
     // ── publisher / subscribers ──────────────────────────────────────────────
     waypoints_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>("/waypoints", 10);
+
+    set_mode_client_ = this->create_client<mavros_msgs::srv::SetMode>(
+      "/" + uav_name_ + "/mavros/set_mode");
 
     state_sub_ = this->create_subscription<mavros_msgs::msg::State>(
       "/" + uav_name_ + "/mavros/state", 10,
@@ -125,6 +129,7 @@ private:
         break;
 
       case PousoFSM::PUBLISH:
+        callAutoLand();
         publishLandingWaypoints();
         attempt_start_ = this->now();
         fsm_ = PousoFSM::MONITOR;
@@ -137,6 +142,31 @@ private:
   }
 
   // ── helpers ────────────────────────────────────────────────────────────────
+
+  void callAutoLand()
+  {
+    if (!set_mode_client_->wait_for_service(std::chrono::seconds(3))) {
+      RCLCPP_WARN(this->get_logger(),
+        "Serviço set_mode não disponível. Pulando AUTO.LAND.");
+      return;
+    }
+
+    auto request = std::make_shared<mavros_msgs::srv::SetMode::Request>();
+    request->base_mode   = 0;
+    request->custom_mode = "AUTO.LAND";
+
+    set_mode_client_->async_send_request(request,
+      [this](rclcpp::Client<mavros_msgs::srv::SetMode>::SharedFuture future) {
+        auto result = future.get();
+        if (result->mode_sent) {
+          RCLCPP_INFO(this->get_logger(),
+            "✅ Modo AUTO.LAND enviado com sucesso ao FCU.");
+        } else {
+          RCLCPP_WARN(this->get_logger(),
+            "⚠️  Falha ao enviar modo AUTO.LAND ao FCU.");
+        }
+      });
+  }
 
   void publishLandingWaypoints()
   {
@@ -210,6 +240,7 @@ private:
   rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr    state_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr    odom_sub_;
   rclcpp::TimerBase::SharedPtr                                timer_;
+  rclcpp::Client<mavros_msgs::srv::SetMode>::SharedPtr        set_mode_client_;
 
   bool   fcu_connected_ {false};
   bool   odom_received_ {false};
