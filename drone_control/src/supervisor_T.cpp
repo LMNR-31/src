@@ -32,7 +32,9 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float32.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 
+#include <cmath>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -60,8 +62,14 @@ public:
       child_pid_(-1),
       trajectory_active_(false),
       trajectory_done_(false),
-      post_reset_ticks_(0)
+      post_reset_ticks_(0),
+      odom_received_(false),
+      current_x_(0.0),
+      current_y_(0.0)
     {
+        this->declare_parameter<std::string>("uav_name", "uav1");
+        uav_name_ = this->get_parameter("uav_name").as_string();
+
         progress_sub_ = this->create_subscription<std_msgs::msg::Float32>(
             "/trajectory_progress", 10,
             std::bind(&SupervisorTNode::progress_callback, this, std::placeholders::_1));
@@ -69,6 +77,10 @@ public:
         finished_sub_ = this->create_subscription<std_msgs::msg::Bool>(
             "/trajectory_finished", 10,
             std::bind(&SupervisorTNode::finished_callback, this, std::placeholders::_1));
+
+        odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+            "/" + uav_name_ + "/mavros/local_position/odom", 10,
+            std::bind(&SupervisorTNode::odom_callback, this, std::placeholders::_1));
 
         // Main FSM timer — runs every 500 ms, never blocks the executor.
         fsm_timer_ = this->create_wall_timer(
@@ -81,6 +93,13 @@ public:
     }
 
 private:
+    // ── /mavros/local_position/odom callback ──────────────────────────────
+    void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+        current_x_ = msg->pose.pose.position.x;
+        current_y_ = msg->pose.pose.position.y;
+        odom_received_ = true;
+    }
+
     // ── /trajectory_progress callback (active only in WAIT_TRAJ) ──────────
     void progress_callback(const std_msgs::msg::Float32::SharedPtr msg) {
         if (state_ != SupervisorState::WAIT_TRAJ) {
@@ -210,18 +229,41 @@ private:
         if (!trajectory_done_) {
             return;
         }
-        RCLCPP_INFO(this->get_logger(),
-            "[WAIT_TRAJ] 🏁 Trajetória concluída — lançando missao_P_T…");
-        child_pid_ = fork_exec("missao_P_T");
+
+        static constexpr double BASE_TOL = 0.1;
+        const bool at_base =
+            odom_received_ &&
+            (std::abs(current_x_) <= BASE_TOL) &&
+            (std::abs(current_y_) <= BASE_TOL);
+
+        const char * next_exec = at_base ? "pouso" : "missao_P_T";
+
+        if (at_base) {
+            RCLCPP_INFO(this->get_logger(),
+                "[WAIT_TRAJ] 🏁 Trajetória concluída e UAV no ponto base "
+                "(x=%.2f y=%.2f) — lançando pouso…",
+                current_x_, current_y_);
+        } else if (!odom_received_) {
+            RCLCPP_WARN(this->get_logger(),
+                "[WAIT_TRAJ] 🏁 Trajetória concluída, mas ainda sem odometria. "
+                "Lançando missao_P_T…");
+        } else {
+            RCLCPP_INFO(this->get_logger(),
+                "[WAIT_TRAJ] 🏁 Trajetória concluída (x=%.2f y=%.2f) — lançando missao_P_T…",
+                current_x_, current_y_);
+        }
+
+        child_pid_ = fork_exec(next_exec);
         if (child_pid_ > 0) {
             reset_trajectory_guards();
             state_ = SupervisorState::RUN_MISSION;
             RCLCPP_INFO(this->get_logger(),
-                "[RUN_MISSION] missao_P_T iniciado (PID %d).",
-                static_cast<int>(child_pid_));
+                "[RUN_MISSION] %s iniciado (PID %d).",
+                next_exec, static_cast<int>(child_pid_));
         } else {
             RCLCPP_ERROR(this->get_logger(),
-                "[WAIT_TRAJ] fork() falhou ao iniciar missao_P_T! Tentando novamente em 500 ms…");
+                "[WAIT_TRAJ] fork() falhou ao iniciar %s! Tentando novamente em 500 ms…",
+                next_exec);
             // Keep trajectory_done_ set so the next tick retries.
         }
     }
@@ -273,15 +315,22 @@ private:
     }
 
     // ── Members ────────────────────────────────────────────────────────────
-    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr progress_sub_;
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr    finished_sub_;
-    rclcpp::TimerBase::SharedPtr                            fsm_timer_;
+    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr  progress_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr     finished_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    rclcpp::TimerBase::SharedPtr                             fsm_timer_;
 
     SupervisorState state_;
     pid_t           child_pid_;           // PID of current child process (-1 if none)
     bool            trajectory_active_;   // true while a trajectory is in progress
     bool            trajectory_done_;     // true when trajectory completion confirmed
     int             post_reset_ticks_;    // cooldown ticks remaining after entering WAIT_TRAJ
+
+    // Odometry / base-point detection
+    std::string uav_name_;
+    bool        odom_received_;
+    double      current_x_;
+    double      current_y_;
 };
 
 int main(int argc, char ** argv) {
