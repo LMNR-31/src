@@ -608,21 +608,19 @@ void DroneControllerCompleto::handle_single_takeoff_waypoint_command(
   // takeoff_xy_origin_threshold_m of the origin AND the latch pose is fresh.
   const geometry_msgs::msg::Pose safe_pose = sanitize_takeoff_xy(pose);
 
-  // Ensure takeoff_target_z_ is recomputed from the current measured altitude
-  // (current_z_real_) every time a new takeoff command is received, whether it
-  // is the first takeoff or a subsequent one after a landing cycle.
-  // There is NO artificial differentiation between cycles — the same formula
-  // always applies:  std::max(hover_altitude, current_z_real_ + takeoff_z_boost).
-  // Computing it HERE (once, at command-receive time) and keeping it FIXED for
-  // the entire climb prevents the infinite-ascent bug that would occur if the
-  // target were recalculated every 10 ms control cycle (it would track the
-  // rising drone and never be reached).
-  takeoff_target_z_ = std::max(
-    config_.hover_altitude,
-    current_z_real_ + config_.takeoff_z_boost);
-  RCLCPP_INFO(this->get_logger(),
-    "⬆️ [TAKEOFF TARGET] Z_real=%.2fm | boost=+%.2fm | hover_alt=%.2fm → Z_alvo=%.2fm (fixo durante subida)",
-    current_z_real_, config_.takeoff_z_boost, config_.hover_altitude, takeoff_target_z_);
+  // Compute the takeoff target altitude from the Z commanded by the waypoint,
+  // clamped to [min_altitude, max_altitude].  This value is fixed here, at
+  // command-receive time, so that the target does not chase the rising drone
+  // every 10 ms control cycle (which would cause infinite ascent).
+  {
+    const double z_cmd = safe_pose.position.z;
+    takeoff_target_z_ = std::min(
+      config_.max_altitude,
+      std::max(config_.min_altitude, z_cmd));
+    RCLCPP_INFO(this->get_logger(),
+      "⬆️ [TAKEOFF TARGET] Z_cmd=%.2fm | clamp[%.2f..%.2f] → Z_alvo=%.2fm (fixo durante subida)",
+      z_cmd, config_.min_altitude, config_.max_altitude, takeoff_target_z_);
+  }
 
   last_waypoint_goal_.pose = safe_pose;
   pouso_em_andamento_ = false;
@@ -902,9 +900,15 @@ void DroneControllerCompleto::mission_waypoints_callback(
     // Guard against near-origin XY; override with latch pose when fresh.
     const geometry_msgs::msg::Pose safe_pose = sanitize_takeoff_xy(msg->poses[0]);
 
-    takeoff_target_z_ = std::max(
-      config_.hover_altitude,
-      current_z_real_ + config_.takeoff_z_boost);
+    {
+      const double z_cmd = safe_pose.position.z;
+      takeoff_target_z_ = std::min(
+        config_.max_altitude,
+        std::max(config_.min_altitude, z_cmd));
+      RCLCPP_INFO(this->get_logger(),
+        "⬆️ [MISSION TAKEOFF TARGET] Z_cmd=%.2fm | clamp[%.2f..%.2f] → Z_alvo=%.2fm (fixo durante subida)",
+        z_cmd, config_.min_altitude, config_.max_altitude, takeoff_target_z_);
+    }
 
     last_waypoint_goal_.pose = safe_pose;
     pouso_em_andamento_ = false;
@@ -1225,15 +1229,19 @@ void DroneControllerCompleto::waypoints_4d_callback(
       poses[0].position.x, poses[0].position.y, poses[0].position.z, yaws[0]);
 
     // Compute and fix the takeoff target altitude at command-receive time.
-    // No differentiation between the first takeoff and subsequent cycles —
-    // the same formula always applies (see handle_single_takeoff_waypoint_command
-    // for the full rationale).  The value is kept fixed throughout the climb.
-    takeoff_target_z_ = std::max(
-      config_.hover_altitude,
-      current_z_real_ + config_.takeoff_z_boost);
-    RCLCPP_INFO(this->get_logger(),
-      "⬆️ [4D TAKEOFF TARGET] Z_real=%.2fm | boost=+%.2fm | hover_alt=%.2fm → Z_alvo=%.2fm (fixo durante subida)",
-      current_z_real_, config_.takeoff_z_boost, config_.hover_altitude, takeoff_target_z_);
+    // The value is kept fixed throughout the climb (see
+    // handle_single_takeoff_waypoint_command for the full rationale).
+    // sanitize_takeoff_xy() does not alter Z, so poses[0].position.z is the
+    // commanded altitude — clamp it to [min_altitude, max_altitude].
+    {
+      const double z_cmd = poses[0].position.z;
+      takeoff_target_z_ = std::min(
+        config_.max_altitude,
+        std::max(config_.min_altitude, z_cmd));
+      RCLCPP_INFO(this->get_logger(),
+        "⬆️ [4D TAKEOFF TARGET] Z_cmd=%.2fm | clamp[%.2f..%.2f] → Z_alvo=%.2fm (fixo durante subida)",
+        z_cmd, config_.min_altitude, config_.max_altitude, takeoff_target_z_);
+    }
 
     goal_yaw_rad_ = yaws[0];
     using_4d_goal_ = true;
@@ -1853,12 +1861,12 @@ void DroneControllerCompleto::handle_state1_takeoff()
   }
 
   // The takeoff target altitude was computed and fixed at command-receive time
-  // (in handle_single_takeoff_waypoint_command() or the 4D equivalent) as:
-  //   takeoff_target_z_ = std::max(hover_altitude, current_z_real_ + takeoff_z_boost)
+  // (in handle_single_takeoff_waypoint_command(), mission_waypoints_callback(),
+  // or the 4D equivalent) as:
+  //   takeoff_target_z_ = clamp(waypoint.z, min_altitude, max_altitude)
   //
-  // There is NO artificial differentiation between the first takeoff and any
-  // subsequent cycle after a landing — the same formula always runs, always
-  // from the actual ground altitude measured at the moment the command arrived.
+  // The drone climbs to the Z commanded by the waypoint (respecting physical
+  // limits), not to hover_altitude or current_z_real_ + takeoff_z_boost.
   // Publishing a fixed target (not recomputed on every 10 ms cycle) prevents
   // the infinite-ascent bug: if the target tracked current_z_real_ every cycle
   // it would rise together with the drone and never be reached.
