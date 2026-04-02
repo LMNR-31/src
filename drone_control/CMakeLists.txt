@@ -96,7 +96,7 @@ install(TARGETS
 
 
 add_executable(supervisor_T src/supervisor_T.cpp)
-ament_target_dependencies(supervisor_T rclcpp std_msgs)
+ament_target_dependencies(supervisor_T rclcpp std_msgs nav_msgs)
 install(TARGETS supervisor_T DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
