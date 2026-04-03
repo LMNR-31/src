@@ -183,6 +183,12 @@ private:
   /// (received within latch_pose_max_age_s).  Logs which XY source is used.
   geometry_msgs::msg::Pose sanitize_takeoff_xy(const geometry_msgs::msg::Pose & pose);
 
+  /// Computes a "look-at" yaw (radians) from the current NED position toward
+  /// (x_target, y_target) using atan2(dy, dx).  Returns current_yaw_rad_
+  /// unchanged when the distance to the target is below the 0.05 m deadband
+  /// to avoid jitter when the drone is already on top of the target.
+  double compute_lookat_yaw(double x_target, double y_target) const;
+
   // ── Waypoint callbacks ───────────────────────────────────────────────────
   void waypoints_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg);
   void mission_waypoints_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg);

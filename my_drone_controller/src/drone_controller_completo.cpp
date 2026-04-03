@@ -593,6 +593,17 @@ geometry_msgs::msg::Pose DroneControllerCompleto::sanitize_takeoff_xy(
   return pose;
 }
 
+double DroneControllerCompleto::compute_lookat_yaw(double x_target, double y_target) const
+{
+  constexpr double kDeadbandM = 0.05;
+  const double dx = x_target - current_x_ned_;
+  const double dy = y_target - current_y_ned_;
+  if (std::hypot(dx, dy) < kDeadbandM) {
+    return current_yaw_rad_;
+  }
+  return std::atan2(dy, dx);
+}
+
 void DroneControllerCompleto::handle_single_takeoff_waypoint_command(
   const geometry_msgs::msg::Pose & pose)
 {
@@ -621,6 +632,17 @@ void DroneControllerCompleto::handle_single_takeoff_waypoint_command(
       "⬆️ [TAKEOFF TARGET] Z_cmd=%.2fm | clamp[%.2f..%.2f] → Z_alvo=%.2fm (fixo durante subida)",
       z_cmd, config_.min_altitude, config_.max_altitude, takeoff_target_z_);
   }
+
+  // Compute a "look-at" yaw so the drone faces the single target waypoint
+  // during takeoff climb and hover.  using_4d_goal_=true enables yaw control
+  // in publish_takeoff_climb_setpoint() and handle_state2_hover().
+  goal_yaw_rad_ = compute_lookat_yaw(safe_pose.position.x, safe_pose.position.y);
+  using_4d_goal_ = true;
+  RCLCPP_INFO(this->get_logger(),
+    "🧭 [SINGLE WP YAW] dx=%.3f m  dy=%.3f m → yaw_alvo=%.3f rad",
+    safe_pose.position.x - current_x_ned_,
+    safe_pose.position.y - current_y_ned_,
+    goal_yaw_rad_);
 
   last_waypoint_goal_.pose = safe_pose;
   pouso_em_andamento_ = false;
