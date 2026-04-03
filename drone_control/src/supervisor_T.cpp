@@ -3,6 +3,10 @@
 // State machine:
 //   INIT        → Forks takeoff process on startup.
 //   TAKING_OFF  → Waits (via WNOHANG poll) for the takeoff process to exit.
+//                 On exit code 0 → transitions to RUN_YAW.
+//                 On any other exit → transitions directly to WAIT_TRAJ.
+//   RUN_YAW     → Forks drone_yaw_360 with yaw_target_delta:=6.2831853,
+//                 waits for it to exit, then transitions to WAIT_TRAJ.
 //   WAIT_TRAJ   → Monitors /trajectory_progress and /trajectory_finished;
 //                 transitions to RUN_MISSION when a trajectory completes.
 //   RUN_MISSION → Forks missao_P_T, waits for it to exit, then loops back
@@ -43,6 +47,7 @@
 enum class SupervisorState {
     INIT,         // Initial state: will fire takeoff immediately
     TAKING_OFF,   // Takeoff process is running; waiting for it to exit
+    RUN_YAW,      // drone_yaw_360 is running; waiting for it to exit
     WAIT_TRAJ,    // Waiting for a trajectory to start and then complete
     RUN_MISSION,  // missao_P_T is running; waiting for it to exit
 };
@@ -159,6 +164,9 @@ private:
             case SupervisorState::TAKING_OFF:
                 check_takeoff();
                 break;
+            case SupervisorState::RUN_YAW:
+                check_yaw();
+                break;
             case SupervisorState::WAIT_TRAJ:
                 check_trajectory();
                 break;
@@ -197,11 +205,64 @@ private:
         }
         if (result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
             RCLCPP_INFO(this->get_logger(),
-                "[TAKING_OFF] ✅ Takeoff concluído com sucesso.");
+                "[TAKING_OFF] ✅ Takeoff concluído com sucesso. "
+                "Iniciando drone_yaw_360…");
+            pid_t yaw_pid = fork_exec_yaw360();
+            child_pid_ = -1;   // takeoff already reaped; clear stale PID
+            if (yaw_pid > 0) {
+                child_pid_ = yaw_pid;
+                RCLCPP_INFO(this->get_logger(),
+                    "[RUN_YAW] drone_yaw_360 iniciado (PID %d) com "
+                    "yaw_target_delta=6.2831853.",
+                    static_cast<int>(child_pid_));
+                state_ = SupervisorState::RUN_YAW;
+            } else {
+                RCLCPP_ERROR(this->get_logger(),
+                    "[TAKING_OFF] fork() falhou ao iniciar drone_yaw_360! "
+                    "Passando direto para WAIT_TRAJ…");
+                reset_trajectory_guards();
+                post_reset_ticks_ = POST_RESET_COOLDOWN_TICKS;
+                state_ = SupervisorState::WAIT_TRAJ;
+                RCLCPP_INFO(this->get_logger(),
+                    "[WAIT_TRAJ] Monitorando /trajectory_progress e "
+                    "/trajectory_finished…");
+            }
         } else {
             RCLCPP_WARN(this->get_logger(),
                 "[TAKING_OFF] ⚠️  Takeoff encerrou (código=%d). Continuando para WAIT_TRAJ.",
                 WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            child_pid_ = -1;
+            reset_trajectory_guards();
+            post_reset_ticks_ = POST_RESET_COOLDOWN_TICKS;
+            state_ = SupervisorState::WAIT_TRAJ;
+            RCLCPP_INFO(this->get_logger(),
+                "[WAIT_TRAJ] Monitorando /trajectory_progress e /trajectory_finished…");
+        }
+    }
+
+    // ── RUN_YAW: poll until drone_yaw_360 exits, then go to WAIT_TRAJ ─────
+    void check_yaw() {
+        int status = 0;
+        pid_t result = waitpid(child_pid_, &status, WNOHANG);
+        if (result == 0) {
+            // Still running.
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[RUN_YAW] Aguardando drone_yaw_360 (PID %d)…",
+                static_cast<int>(child_pid_));
+            return;
+        }
+        if (result > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            RCLCPP_INFO(this->get_logger(),
+                "[RUN_YAW] ✅ drone_yaw_360 (PID %d) finalizado com sucesso.",
+                static_cast<int>(child_pid_));
+        } else if (result > 0 && WIFEXITED(status)) {
+            RCLCPP_WARN(this->get_logger(),
+                "[RUN_YAW] ⚠️  drone_yaw_360 (PID %d) encerrou com código %d.",
+                static_cast<int>(child_pid_), WEXITSTATUS(status));
+        } else {
+            RCLCPP_WARN(this->get_logger(),
+                "[RUN_YAW] ⚠️  drone_yaw_360 (PID %d) encerrou de forma anormal.",
+                static_cast<int>(child_pid_));
         }
         child_pid_ = -1;
         reset_trajectory_guards();
@@ -304,6 +365,19 @@ private:
             execlp("ros2", "ros2", "run", "drone_control", executable,
                    static_cast<char *>(nullptr));
             // execlp only returns on failure.
+            _exit(1);
+        }
+        return pid;   // > 0 in parent on success; -1 on fork failure
+    }
+
+    // Launches: ros2 run drone_control drone_yaw_360
+    //              --ros-args -p yaw_target_delta:=6.2831853
+    pid_t fork_exec_yaw360() {
+        pid_t pid = fork();
+        if (pid == 0) {
+            execlp("ros2", "ros2", "run", "drone_control", "drone_yaw_360",
+                   "--ros-args", "-p", "yaw_target_delta:=6.2831853",
+                   static_cast<char *>(nullptr));
             _exit(1);
         }
         return pid;   // > 0 in parent on success; -1 on fork failure
