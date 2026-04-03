@@ -1,186 +1,152 @@
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/qos.hpp>
 
 #include <cv_bridge/cv_bridge.hpp>
-#include <image_transport/image_transport.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
 #include <opencv2/opencv.hpp>
 
 #include <map>
 #include <mutex>
-#include <thread>
+#include <string>
+#include <vector>
 
 class CameraViewer : public rclcpp::Node {
 private:
-  std::shared_ptr<image_transport::ImageTransport> it_;
-  std::map<std::string, cv::Mat> images_;
+  std::map<std::string, cv::Mat> images_rgb_;
   std::mutex image_mutex_;
-  std::vector<image_transport::Subscriber> subscribers_;
-  int window_width_{1600}, window_height_{900};
-  bool running_{false};
-  std::thread display_thread_;
-  cv::Mat canvas_;
+
+  std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> subs_;
+
+  int window_width_{1600};
+  int window_height_{900};
 
 public:
   CameraViewer() : Node("camera_viewer") {
-    // NÃO use shared_from_this() aqui.
-    this->declare_parameter<int>("window_width", 1600);
-    this->declare_parameter<int>("window_height", 900);
+    declare_parameter<int>("window_width", 1600);
+    declare_parameter<int>("window_height", 900);
+    window_width_ = get_parameter("window_width").as_int();
+    window_height_ = get_parameter("window_height").as_int();
 
-    window_width_ = this->get_parameter("window_width").as_int();
-    window_height_ = this->get_parameter("window_height").as_int();
-  }
-
-  // Chame isso depois de criar o node com make_shared
-  void init() {
-    // Agora sim shared_from_this() é válido
-    it_ = std::make_shared<image_transport::ImageTransport>(shared_from_this());
-
-    running_ = true;
-
-    // Câmeras a monitorar
-    std::vector<std::string> camera_topics = {
-       
-        "/uav1/rgbd_front/color/image_raw",
-        "/uav1/rgbd_down/color/image_raw"};
-
-    for (const auto &topic : camera_topics) {
-      auto sub = it_->subscribe(
-          topic, 1,
-          [this, topic](const sensor_msgs::msg::Image::ConstSharedPtr &msg) {
-            this->imageCallback(msg, topic);
-          });
-      subscribers_.push_back(sub);
-      RCLCPP_INFO(this->get_logger(), "Subscribed to: %s", topic.c_str());
-    }
-
-    canvas_ = cv::Mat(window_height_, window_width_, CV_8UC3, cv::Scalar(0, 0, 0));
-
-    cv::startWindowThread();
     cv::namedWindow("Drone Cameras", cv::WINDOW_NORMAL);
     cv::resizeWindow("Drone Cameras", window_width_, window_height_);
 
-    display_thread_ = std::thread([this]() { this->displayLoop(); });
+    const std::vector<std::string> topics = {
+        "/uav1/rgbd_front/color/image_raw",
+        "/uav1/rgbd_down/color/image_raw",
+    };
+
+    auto qos = rclcpp::SensorDataQoS();
+
+    for (const auto &topic : topics) {
+      auto sub = this->create_subscription<sensor_msgs::msg::Image>(
+          topic, qos,
+          [this, topic](const sensor_msgs::msg::Image::ConstSharedPtr msg) {
+            this->imageCallback(msg, topic);
+          });
+      subs_.push_back(sub);
+      RCLCPP_INFO(get_logger(), "Subscribed to: %s", topic.c_str());
+    }
   }
 
-  ~CameraViewer() override {
-    running_ = false;
-    if (display_thread_.joinable()) {
-      display_thread_.join();
+  void spinRender() {
+    // WallRate não depende do contexto ROS estar válido (evita crash no Ctrl+C)
+    rclcpp::WallRate rate(30);
+
+    while (rclcpp::ok()) {
+      rclcpp::spin_some(shared_from_this());
+
+      // snapshot das imagens
+      std::map<std::string, cv::Mat> images_copy;
+      {
+        std::lock_guard<std::mutex> lock(image_mutex_);
+        images_copy = images_rgb_;
+      }
+
+      cv::Mat canvas_bgr = createCanvasBGR(images_copy);
+      cv::imshow("Drone Cameras", canvas_bgr);
+
+      int key = cv::waitKey(1) & 0xFF;
+      if (key == 27) {  // ESC
+        rclcpp::shutdown();
+        break;
+      }
+
+      // Se Ctrl+C aconteceu durante o loop, sai sem tentar dormir
+      if (!rclcpp::ok()) {
+        break;
+      }
+      rate.sleep();
     }
-    cv::destroyAllWindows();
   }
 
 private:
   void imageCallback(const sensor_msgs::msg::Image::ConstSharedPtr &msg,
                      const std::string &topic) {
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                         "RX %s %ux%u encoding=%s",
+                         topic.c_str(), msg->width, msg->height, msg->encoding.c_str());
+
     try {
-      if (msg->encoding != "rgb8") {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                             "Unexpected encoding '%s' on %s; expected rgb8 — skipping",
-                             msg->encoding.c_str(), topic.c_str());
-        return;
-      }
-
-      // Share the buffer in rgb8 encoding, then clone for thread-safe ownership
-      // (toCvShare borrows the message buffer).
+      // Guarda como RGB
       auto cv_ptr = cv_bridge::toCvShare(msg, "rgb8");
+      const cv::Mat &rgb = cv_ptr->image;
 
-      {
-        std::lock_guard<std::mutex> lock(image_mutex_);
-        images_[topic] = cv_ptr->image.clone(); // store as RGB
-      }
-    } catch (const cv_bridge::Exception &e) {
-      RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
+      std::lock_guard<std::mutex> lock(image_mutex_);
+      images_rgb_[topic] = rgb.clone();
     } catch (const std::exception &e) {
-      RCLCPP_ERROR(this->get_logger(), "imageCallback exception: %s", e.what());
+      RCLCPP_ERROR(get_logger(), "cv_bridge error on %s: %s", topic.c_str(), e.what());
     }
   }
 
-  void displayLoop() {
-    while (running_ && rclcpp::ok()) {
-      cv::Mat frame;
-      {
-        std::lock_guard<std::mutex> lock(image_mutex_);
-        if (!images_.empty()) {
-          canvas_ = createCanvas(images_);
-        }
-        frame = canvas_;
-      }
-      cv::imshow("Drone Cameras", frame);
-      int key = cv::waitKey(30) & 0xFF;
-      if (key == 27) { // ESC
-        running_ = false;
-        rclcpp::shutdown();
-      }
-    }
-  }
-
-  cv::Mat createCanvas(const std::map<std::string, cv::Mat> &images) {
-    int num_images = static_cast<int>(images.size());
-    int cols = (num_images <= 2) ? num_images : 2;
-    int rows = (num_images + cols - 1) / cols;
-
-    int img_width = window_width_ / cols;
-    int img_height = window_height_ / rows;
-
+  cv::Mat createCanvasBGR(const std::map<std::string, cv::Mat> &images_rgb) {
+    // fundo preto
     cv::Mat canvas(window_height_, window_width_, CV_8UC3, cv::Scalar(0, 0, 0));
 
-    int idx = 0;
-    for (const auto &[topic, image] : images) {
-      if (image.empty()) {
-        idx++;
+    // Queremos sempre 2 “slots” (front e down)
+    struct Slot { std::string topic; std::string label; };
+    const std::vector<Slot> slots = {
+        {"/uav1/rgbd_front/color/image_raw", "rgbd_front"},
+        {"/uav1/rgbd_down/color/image_raw",  "rgbd_down"},
+    };
+
+    const int cols = 2;
+    const int rows = 1;
+    const int cell_w = window_width_ / cols;
+    const int cell_h = window_height_ / rows;
+
+    for (int i = 0; i < (int)slots.size(); ++i) {
+      int col = i % cols;
+      int row = i / cols;
+      int x0 = col * cell_w;
+      int y0 = row * cell_h;
+
+      auto it = images_rgb.find(slots[i].topic);
+      if (it == images_rgb.end() || it->second.empty()) {
+        cv::putText(canvas, ("waiting: " + slots[i].label),
+                    cv::Point(x0 + 20, y0 + 40),
+                    cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
         continue;
       }
 
-      int row = idx / cols;
-      int col = idx % cols;
+      // resize RGB
+      cv::Mat resized_rgb;
+      cv::resize(it->second, resized_rgb, cv::Size(cell_w, cell_h));
 
-      cv::Mat resized;
-      cv::resize(image, resized, cv::Size(img_width, img_height));
-
-      // Images are stored as RGB; convert to BGR for OpenCV display.
+      // converte RGB->BGR para mostrar
       cv::Mat resized_bgr;
-      cv::cvtColor(resized, resized_bgr, cv::COLOR_RGB2BGR);
+      cv::cvtColor(resized_rgb, resized_bgr, cv::COLOR_RGB2BGR);
 
-      int y_start = row * img_height;
-      int x_start = col * img_width;
+      resized_bgr.copyTo(canvas(cv::Rect(x0, y0, cell_w, cell_h)));
 
-      resized_bgr.copyTo(canvas(cv::Rect(x_start, y_start, img_width, img_height)));
-
-      // Extract camera name from topic (e.g., /uav1/bluefox_down/image_raw ->
-      // bluefox_down)
-      size_t last_slash = topic.find_last_of('/');
-      size_t second_last_slash = topic.find_last_of('/', last_slash - 1);
-      std::string camera_name =
-          (second_last_slash != std::string::npos)
-              ? topic.substr(second_last_slash + 1,
-                             last_slash - second_last_slash - 1)
-              : topic;
-
-      cv::putText(canvas, camera_name, cv::Point(x_start + 10, y_start + 30),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
-
-      idx++;
+      cv::putText(canvas, slots[i].label,
+                  cv::Point(x0 + 20, y0 + 40),
+                  cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
     }
 
-    // Separator lines between cameras
-    cv::Scalar line_color = cv::Scalar(200, 200, 200); // Light gray
-    int line_thickness = 2;
-
-    // Vertical lines (between columns)
-    for (int col = 1; col < cols; col++) {
-      int x = col * img_width;
-      cv::line(canvas, cv::Point(x, 0), cv::Point(x, window_height_), line_color,
-               line_thickness);
-    }
-
-    // Horizontal lines (between rows)
-    for (int row = 1; row < rows; row++) {
-      int y = row * img_height;
-      cv::line(canvas, cv::Point(0, y), cv::Point(window_width_, y), line_color,
-               line_thickness);
-    }
+    // linha separadora vertical
+    cv::line(canvas, cv::Point(cell_w, 0), cv::Point(cell_w, window_height_),
+             cv::Scalar(200, 200, 200), 2);
 
     return canvas;
   }
@@ -188,11 +154,8 @@ private:
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
-
   auto node = std::make_shared<CameraViewer>();
-  node->init();
-
-  rclcpp::spin(node);
+  node->spinRender();
   rclcpp::shutdown();
   return 0;
 }

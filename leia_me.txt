@@ -15,9 +15,11 @@ rm -rf ~/ros2_ws/log
 
 
 # para takeoff
-ros2 run drone_control takeoff --ros-args -p uav_name:=uav1 -p takeoff_altitude:=1.5
-# ou 
 ros2 run drone_control takeoff
+
+# ou 
+ros2 run drone_control takeoff --ros-args -p uav_name:=uav1 -p takeoff_altitude:=1.5
+
 #ou
 ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
   frame_id: 'map'
@@ -27,11 +29,7 @@ poses:
 
 # para pouso 
 ros2 run drone_control pouso
-# ou
-ros2 run drone_control pouso --ros-args \
-  -p use_current_xy:=false \
-  -p x:=3.0 \
-  -p y:=-2.0
+
   
 #missão pouso e takeoff
 ros2 run drone_control missao_P_T
@@ -43,12 +41,7 @@ ros2 run drone_control camera_viewer
 ros2 run drone_control supervisor_T
 
 ros2 topic pub /waypoint_goal geometry_msgs/msg/PoseStamped '{
-  header: {frame_id: "map"},
-  pose: {
-    position: {x: 5.0, y: 3.0, z: 2.5},
-    
-  }
-}'
+
 # dar um 360
 ros2 run drone_control drone_yaw_360 --ros-args -p yaw_target_delta:=6.2831853
 
@@ -58,32 +51,106 @@ ros2 run drone_control drone_yaw_360 --ros-args -p yaw_target_delta:=1.570796
 # dar um 180
 ros2 run drone_control drone_yaw_360 --ros-args -p yaw_target_delta:=-3.141592
 
-# trajetoria
+#trajetoria com dois pontos
 ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
   frame_id: map
 poses:
-- position: {x: 2.0, y: 0.0, z: 1.5}
+- position: {x: 0.0, y: 0.0, z: 1.5}
   orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
-- position: {x: 4.0, y: 0.0, z: 1.5}
-  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
-- position: {x: 4.0, y: 5.0, z: 1.5}
-  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
-- position: {x: 0.0, y: 5.0, z: 1.5}
-  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
-- position: {x: 6.0, y: 6.0, z: 1.5}
+- position: {x: 0.0, y: 2.250, z: 1.5}
   orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
 
- ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
+ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
   frame_id: map
 poses:
-- position: {x: 0.0, y: 0.0, z: 2.0}
+- position: {x: 0.0, y: 2.250, z: 1.5}
   orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
-- position: {x: 3.0, y: 3.0, z: 4.0}
-  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
-- position: {x: 6.0, y: 1.0, z: 2.0}
-  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
-- position: {x: 7.0, y: 2.0, z: 1.5}
-  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
-- position: {x: 0.0, y: 0.0, z: 2.0}
+- position: {x: 0.50, y: 5.250, z: 1.5}
   orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+
+ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
+  frame_id: map
+poses:
+- position: {x: 0.50, y: 5.250, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+- position: {x: 3.50, y: 5.750, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+
+ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
+  frame_id: map
+poses:
+- position: {x: 3.50, y: 5.750, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+- position: {x: 3.0, y: 3.750, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+  
+ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
+  frame_id: map
+poses:
+- position: {x: 3.0, y: 3.750, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+- position: {x: 6.0, y: 2.250, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+  
+ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
+  frame_id: map
+poses:
+- position: {x: 6.0, y: 2.250, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+- position: {x: 4.0, y: 0.338, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+  
+ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
+  frame_id: map
+poses:
+- position: {x: 4.0, y: 0.338, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+- position: {x: 0.0, y: 0.0, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+  
+  
+# trajetoria com um ponto
+
+ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
+  frame_id: map
+poses:
+- position: {x: 0.0, y: 2.250, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+  
+ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
+  frame_id: map
+poses:
+- position: {x: 0.50, y: 5.250, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+
+ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
+  frame_id: map
+poses:
+- position: {x: 3.50, y: 5.750, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+
+ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
+  frame_id: map
+poses:
+- position: {x: 3.0, y: 3.750, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+
+ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
+  frame_id: map
+poses:
+- position: {x: 6.0, y: 2.250, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+  
+ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
+  frame_id: map
+poses:
+- position: {x: 4.0, y: 0.338, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+  
+ros2 topic pub --once /waypoints geometry_msgs/msg/PoseArray "header:
+  frame_id: map
+poses:
+- position: {x: 0.0, y: 0.0, z: 1.5}
+  orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}"
+
 
