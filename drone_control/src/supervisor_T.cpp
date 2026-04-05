@@ -83,6 +83,9 @@ public:
             "/trajectory_finished", 10,
             std::bind(&SupervisorTNode::finished_callback, this, std::placeholders::_1));
 
+        mission_cycle_done_pub_ = this->create_publisher<std_msgs::msg::Bool>(
+            "/mission_cycle_done", 10);
+
         odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
             "/" + uav_name_ + "/mavros/local_position/odom", 10,
             std::bind(&SupervisorTNode::odom_callback, this, std::placeholders::_1));
@@ -350,6 +353,14 @@ private:
                 static_cast<int>(child_pid_));
         }
         child_pid_ = -1;
+
+        // Signal the Python waypoint supervisor that this mission cycle is done.
+        std_msgs::msg::Bool done_msg;
+        done_msg.data = true;
+        mission_cycle_done_pub_->publish(done_msg);
+        RCLCPP_INFO(this->get_logger(),
+            "[RUN_MISSION] 📢 /mission_cycle_done=true publicado.");
+
         reset_trajectory_guards();
         post_reset_ticks_ = POST_RESET_COOLDOWN_TICKS;
         state_ = SupervisorState::WAIT_TRAJ;
@@ -391,6 +402,7 @@ private:
     // ── Members ────────────────────────────────────────────────────────────
     rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr  progress_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr     finished_sub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr        mission_cycle_done_pub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::TimerBase::SharedPtr                             fsm_timer_;
 

@@ -46,6 +46,7 @@ class PadWaypointSupervisor(Node):
 
         self.declare_parameter("trajectory_finished_topic", "/trajectory_finished")
         self.declare_parameter("use_trajectory_finished", True)
+        self.declare_parameter("mission_cycle_done_topic", "/mission_cycle_done")
         self.declare_parameter("controller_state_topic", "/drone_controller/state_voo")
 
         self.declare_parameter("map_frame", "uav1/map")     # used in PoseArray.header.frame_id
@@ -68,6 +69,7 @@ class PadWaypointSupervisor(Node):
 
         self.trajectory_finished_topic = self.get_parameter("trajectory_finished_topic").value
         self.use_trajectory_finished = bool(self.get_parameter("use_trajectory_finished").value)
+        self.mission_cycle_done_topic = self.get_parameter("mission_cycle_done_topic").value
         self.controller_state_topic = self.get_parameter("controller_state_topic").value
 
         self.map_frame = self.get_parameter("map_frame").value
@@ -91,6 +93,7 @@ class PadWaypointSupervisor(Node):
 
         self.trajectory_finished = False
         self._last_finished_msg_t = 0.0
+        self.mission_cycle_done = False
         self.ready_for_commands = (not self.use_trajectory_finished)
         if self.ready_for_commands:
             self.get_logger().info("[READY] use_trajectory_finished=False, enabling waypoint publishing immediately.")
@@ -103,7 +106,7 @@ class PadWaypointSupervisor(Node):
         self.candidates: List[BaseCandidate] = []
         self.active_target: Optional[Tuple[float, float]] = None
         self.visited_count = 0
-        self.state = "DISCOVER"   # DISCOVER -> NAVIGATE -> WAIT_DONE -> ... -> RETURN_HOME -> DONE
+        self.state = "DISCOVER"   # DISCOVER -> NAVIGATE -> WAIT_MISSION_DONE -> ... -> RETURN_HOME -> DONE
 
         # ROS I/O
         self.sub_odom = self.create_subscription(Odometry, self.odom_topic, self.cb_odom, 10)
@@ -114,6 +117,9 @@ class PadWaypointSupervisor(Node):
             self.sub_finished = self.create_subscription(Bool, self.trajectory_finished_topic, self.cb_finished, 10)
         else:
             self.sub_finished = None
+
+        self.sub_mission_cycle_done = self.create_subscription(
+            Bool, self.mission_cycle_done_topic, self.cb_mission_cycle_done, 10)
 
         self.sub_state_voo = self.create_subscription(
             Int32, self.controller_state_topic, self.cb_state_voo,
@@ -135,6 +141,7 @@ class PadWaypointSupervisor(Node):
             f" down_det_topic={self.down_det_topic}\n"
             f" waypoints_topic={self.waypoints_topic}\n"
             f" controller_state_topic={self.controller_state_topic}\n"
+            f" mission_cycle_done_topic={self.mission_cycle_done_topic}\n"
             f" map_frame={self.map_frame} z_fixed={self.z_fixed}\n"
             f" bases_to_visit={self.bases_to_visit}\n"
             f" cluster_tol_m={self.cluster_tol_m} min_seen_count={self.min_seen_count}"
@@ -146,6 +153,15 @@ class PadWaypointSupervisor(Node):
         if msg.data and not self.ready_for_commands:
             self.ready_for_commands = True
             self.get_logger().info("[READY] Controller signaled /trajectory_finished. Enabling waypoint publishing.")
+
+    def cb_mission_cycle_done(self, msg: Bool):
+        if msg.data and self.state == "WAIT_MISSION_DONE":
+            self.mission_cycle_done = True
+            self.get_logger().info("[HANDSHAKE] /mission_cycle_done=true received — mission cycle complete.")
+        elif msg.data:
+            self.get_logger().debug(
+                f"[HANDSHAKE] /mission_cycle_done=true received but ignored (state={self.state})."
+            )
 
     def cb_state_voo(self, msg: Int32):
         self.state_voo = int(msg.data)
@@ -266,12 +282,6 @@ class PadWaypointSupervisor(Node):
                 c.visited = True
 
     def _publish_two_pose_waypoints(self, tx: float, ty: float):
-        if self.state_voo != 2:
-            self.get_logger().debug(
-                f"_publish_two_pose_waypoints skipped: state_voo={self.state_voo} (need 2=HOVER)"
-            )
-            return
-
         pa = PoseArray()
         pa.header.stamp = self.get_clock().now().to_msg()
         pa.header.frame_id = self.map_frame
@@ -294,11 +304,6 @@ class PadWaypointSupervisor(Node):
     def tick(self):
         if not self.have_odom:
             return
-
-        # If finished topic is enabled, require it to be "recent" (avoid stale latched true)
-        finished_recent = True
-        if self.use_trajectory_finished:
-            finished_recent = (time.time() - self._last_finished_msg_t) < 2.0
 
         # State machine
         if self.state == "DISCOVER":
@@ -327,35 +332,36 @@ class PadWaypointSupervisor(Node):
 
             d = math.hypot(tx - self.cur_x, ty - self.cur_y)
             if d <= self.reach_tol_m:
-                self.get_logger().info(f"Reached target within {self.reach_tol_m}m (d={d:.2f}). Waiting mission completion.")
-                self.state = "WAIT_DONE"
-                # reset finished flag so we wait for the next completion edge
-                self.trajectory_finished = False
+                self.get_logger().info(
+                    f"[STATE] Reached base within {self.reach_tol_m}m (d={d:.2f}). "
+                    "Waiting for mission cycle to complete (WAIT_MISSION_DONE).")
+                self.state = "WAIT_MISSION_DONE"
+                # Reset handshake flag to discard any stale signal that arrived
+                # before we entered this state (e.g. from the previous cycle).
+                self.mission_cycle_done = False
                 return
 
-        if self.state == "WAIT_DONE":
-            # If you have trajectory_finished, wait for it to be true.
-            # Otherwise just wait a bit.
-            if self.use_trajectory_finished:
-                if finished_recent and self.trajectory_finished:
-                    # mark visited and move on
-                    tx, ty = self.active_target if self.active_target else (None, None)
-                    if tx is not None:
-                        self._mark_visited(tx, ty)
+        if self.state == "WAIT_MISSION_DONE":
+            # Hold position — do not publish new navigation targets.
+            # Wait until supervisor_T signals that missao_P_T has finished.
+            if not self.mission_cycle_done:
+                return
 
-                    self.visited_count += 1
-                    self.get_logger().info(f"Mission done. visited={self.visited_count}/{self.bases_to_visit}")
-                    self.active_target = None
-                    self.state = "DISCOVER"
-            else:
-                # simple timeout fallback
-                time.sleep(1.0)
-                tx, ty = self.active_target if self.active_target else (None, None)
-                if tx is not None:
-                    self._mark_visited(tx, ty)
-                self.visited_count += 1
-                self.active_target = None
-                self.state = "DISCOVER"
+            # Mission cycle done: mark this base as visited and select next.
+            tx, ty = self.active_target if self.active_target else (None, None)
+            if tx is not None:
+                self._mark_visited(tx, ty)
+
+            self.visited_count += 1
+            # Reset for next cycle (the pre-state reset at entry guarded against
+            # stale signals; this reset ensures a clean state going forward).
+            self.mission_cycle_done = False
+            self.get_logger().info(
+                f"[STATE] Mission cycle done — base marked visited. "
+                f"visited={self.visited_count}/{self.bases_to_visit}. "
+                "Transitioning to DISCOVER.")
+            self.active_target = None
+            self.state = "DISCOVER"
 
         if self.state == "RETURN_HOME":
             # publish until reached home, then DONE
