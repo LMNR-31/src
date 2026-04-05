@@ -55,14 +55,16 @@ class PadWaypointSupervisor(Node):
         self.declare_parameter("z_fixed", 1.5)
         self.declare_parameter("bases_to_visit", 6)
 
-        self.declare_parameter("cluster_tol_m", 0.7)        # merge detections within this radius
+        self.declare_parameter("cluster_tol_m", 1.2)        # merge detections within this radius
         self.declare_parameter("min_seen_count", 3)         # require stable detection before accepting a base
-        self.declare_parameter("candidate_timeout_s", 5.0)  # drop candidates not seen recently
+        self.declare_parameter("candidate_timeout_s", 30.0) # drop candidates not seen recently
 
         self.declare_parameter("publish_period_s", 0.25)    # how often to republish target while navigating
         self.declare_parameter("reach_tol_m", 0.6)           # consider reached when within this XY distance
         self.declare_parameter("home_x", 0.0)
         self.declare_parameter("home_y", 0.0)
+        self.declare_parameter("repeat_block_m", 1.2)       # skip targets within this radius of any visited position
+        self.declare_parameter("aim_at_home", False)        # orient waypoints to face toward home
 
         self.odom_topic = self.get_parameter("odom_topic").value
         self.front_det_topic = self.get_parameter("front_det_topic").value
@@ -88,6 +90,8 @@ class PadWaypointSupervisor(Node):
         self.reach_tol_m = float(self.get_parameter("reach_tol_m").value)
         self.home_x = float(self.get_parameter("home_x").value)
         self.home_y = float(self.get_parameter("home_y").value)
+        self.repeat_block_m = float(self.get_parameter("repeat_block_m").value)
+        self.aim_at_home = bool(self.get_parameter("aim_at_home").value)
 
         # State
         self.have_odom = False
@@ -112,7 +116,13 @@ class PadWaypointSupervisor(Node):
         self.candidates: List[BaseCandidate] = []
         self.active_target: Optional[Tuple[float, float]] = None
         self.visited_count = 0
+        self.visited_positions: List[Tuple[float, float]] = []
         self.state = "SCAN"   # SCAN -> DISCOVER -> NAVIGATE -> WAIT_MISSION_DONE -> ... -> RETURN_HOME -> DONE
+
+        # Home captured from the first odom reading (used for aim_at_home)
+        self._have_home_from_odom = False
+        self._home_from_odom_x = 0.0
+        self._home_from_odom_y = 0.0
 
         # ROS I/O
         self.sub_odom = self.create_subscription(Odometry, self.odom_topic, self.cb_odom, 10)
@@ -195,6 +205,16 @@ class PadWaypointSupervisor(Node):
         self.cur_y = float(msg.pose.pose.position.y)
         q = msg.pose.pose.orientation
         self.cur_yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
+
+        # Capture home position from the very first odom message
+        if not self._have_home_from_odom:
+            self._have_home_from_odom = True
+            self._home_from_odom_x = self.cur_x
+            self._home_from_odom_y = self.cur_y
+            self.get_logger().info(
+                f"[HOME] Home captured from first odom: "
+                f"({self._home_from_odom_x:.2f}, {self._home_from_odom_y:.2f})"
+            )
 
         # Update map frame from odom if it looks namespaced (optional)
         if msg.header.frame_id:
@@ -296,6 +316,13 @@ class PadWaypointSupervisor(Node):
                 continue
             if c.seen_count < self.min_seen_count:
                 continue
+            # Anti-repeat guard: skip candidates too close to any previously
+            # visited position (based on actual drone odom at visit time).
+            if any(
+                math.hypot(c.x - vx, c.y - vy) <= self.repeat_block_m
+                for vx, vy in self.visited_positions
+            ):
+                continue
             d = math.hypot(c.x - self.cur_x, c.y - self.cur_y)
             if best is None or d < best_d:
                 best = c
@@ -309,6 +336,13 @@ class PadWaypointSupervisor(Node):
             if math.hypot(c.x - x, c.y - y) <= self.cluster_tol_m:
                 c.visited = True
 
+    def _yaw_toward(
+        self, from_x: float, from_y: float, to_x: float, to_y: float
+    ) -> Tuple[float, float]:
+        """Return (qz, qw) quaternion components for a yaw that faces (to_x,to_y) from (from_x,from_y)."""
+        theta = math.atan2(to_y - from_y, to_x - from_x)
+        return math.sin(theta / 2.0), math.cos(theta / 2.0)
+
     def _publish_two_pose_waypoints(self, tx: float, ty: float):
         pa = PoseArray()
         pa.header.stamp = self.get_clock().now().to_msg()
@@ -318,13 +352,35 @@ class PadWaypointSupervisor(Node):
         p0.position.x = float(self.cur_x)
         p0.position.y = float(self.cur_y)
         p0.position.z = float(self.z_fixed)
-        p0.orientation.w = 1.0
 
         p1 = Pose()
         p1.position.x = float(tx)
         p1.position.y = float(ty)
         p1.position.z = float(self.z_fixed)
-        p1.orientation.w = 1.0
+
+        if self.aim_at_home and self._have_home_from_odom:
+            qz0, qw0 = self._yaw_toward(
+                self.cur_x, self.cur_y,
+                self._home_from_odom_x, self._home_from_odom_y,
+            )
+            p0.orientation.z = qz0
+            p0.orientation.w = qw0
+            qz1, qw1 = self._yaw_toward(
+                tx, ty,
+                self._home_from_odom_x, self._home_from_odom_y,
+            )
+            p1.orientation.z = qz1
+            p1.orientation.w = qw1
+        elif self.aim_at_home and not self._have_home_from_odom:
+            self.get_logger().warning(
+                "[aim_at_home] Home position not yet captured from odom; "
+                "using identity orientation until first odom is received."
+            )
+            p0.orientation.w = 1.0
+            p1.orientation.w = 1.0
+        else:
+            p0.orientation.w = 1.0
+            p1.orientation.w = 1.0
 
         pa.poses = [p0, p1]
         self.pub_waypoints.publish(pa)
@@ -393,17 +449,21 @@ class PadWaypointSupervisor(Node):
             if not self.mission_cycle_done:
                 return
 
-            # Mission cycle done: mark this base as visited and select next.
-            tx, ty = self.active_target if self.active_target else (None, None)
-            if tx is not None:
-                self._mark_visited(tx, ty)
+            # Mission cycle done: mark this base as visited using the actual
+            # drone odom position (not the target coordinates) so that the
+            # repeat_block_m guard correctly covers the real landing spot.
+            visit_x = self.cur_x
+            visit_y = self.cur_y
+            self._mark_visited(visit_x, visit_y)
+            self.visited_positions.append((visit_x, visit_y))
 
             self.visited_count += 1
             # Reset for next cycle (the pre-state reset at entry guarded against
             # stale signals; this reset ensures a clean state going forward).
             self.mission_cycle_done = False
             self.get_logger().info(
-                f"[STATE] Mission cycle done — base marked visited. "
+                f"[STATE] Mission cycle done — base marked visited at odom "
+                f"({visit_x:.2f}, {visit_y:.2f}). "
                 f"visited={self.visited_count}/{self.bases_to_visit}. "
                 "Transitioning to DISCOVER.")
             self.active_target = None

@@ -9,8 +9,9 @@
 //                 waits for it to exit, then transitions to WAIT_TRAJ.
 //   WAIT_TRAJ   → Monitors /trajectory_progress and /trajectory_finished;
 //                 transitions to RUN_MISSION when a trajectory completes.
-//   RUN_MISSION → Forks missao_P_T, waits for it to exit, then loops back
-//                 to WAIT_TRAJ for the next cycle (infinite loop).
+//   RUN_MISSION → Forks missao_P_T (or pouso when use_origin_as_base=true and
+//                 the UAV is at the origin), waits for it to exit, then loops
+//                 back to WAIT_TRAJ for the next cycle (infinite loop).
 //
 // Trajectory-detection logic (WAIT_TRAJ only):
 //   • /trajectory_progress < 99.9  → new trajectory in progress (reset guards)
@@ -29,6 +30,13 @@
 //
 // All child processes are spawned via fork()/execlp() and reaped with
 // waitpid(WNOHANG) inside the FSM timer to keep the executor unblocked.
+//
+// Parameters:
+//   uav_name            (string, default "uav1")  — UAV namespace prefix
+//   use_origin_as_base  (bool,   default false)   — when true, launch pouso
+//                         instead of missao_P_T if the drone is within 0.1 m
+//                         of (0,0) at trajectory completion; when false (the
+//                         default) always launch missao_P_T.
 //
 // Usage:
 //   ros2 run drone_control supervisor_T
@@ -70,10 +78,15 @@ public:
       post_reset_ticks_(0),
       odom_received_(false),
       current_x_(0.0),
-      current_y_(0.0)
+      current_y_(0.0),
+      use_origin_as_base_(false),
+      current_child_exec_("missao_P_T")
     {
         this->declare_parameter<std::string>("uav_name", "uav1");
         uav_name_ = this->get_parameter("uav_name").as_string();
+
+        this->declare_parameter<bool>("use_origin_as_base", false);
+        use_origin_as_base_ = this->get_parameter("use_origin_as_base").as_bool();
 
         progress_sub_ = this->create_subscription<std_msgs::msg::Float32>(
             "/trajectory_progress", 10,
@@ -100,7 +113,9 @@ public:
 
         RCLCPP_INFO(this->get_logger(),
             "supervisor_T iniciado — executando takeoff automático e iniciando "
-            "missao_P_T em ciclos infinitos após cada trajetória.");
+            "missao_P_T em ciclos infinitos após cada trajetória. "
+            "use_origin_as_base=%s",
+            use_origin_as_base_ ? "true" : "false");
     }
 
 private:
@@ -307,13 +322,19 @@ private:
             return;
         }
 
+        // Determine which executable to launch next.
+        // When use_origin_as_base_=false (default), always run missao_P_T.
+        // When use_origin_as_base_=true, run pouso only if the UAV is within
+        // BASE_TOL metres of the origin; otherwise run missao_P_T.
         static constexpr double BASE_TOL = 0.1;
         const bool at_base =
+            use_origin_as_base_ &&
             odom_received_ &&
             (std::abs(current_x_) <= BASE_TOL) &&
             (std::abs(current_y_) <= BASE_TOL);
 
         const char * next_exec = at_base ? "pouso" : "missao_P_T";
+        current_child_exec_ = next_exec;
 
         if (at_base) {
             RCLCPP_INFO(this->get_logger(),
@@ -352,18 +373,19 @@ private:
         if (result == 0) {
             // Still running.
             RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                "[RUN_MISSION] Aguardando missao_P_T (PID %d)…",
-                static_cast<int>(child_pid_));
+                "[RUN_MISSION] Aguardando %s (PID %d)…",
+                current_child_exec_.c_str(), static_cast<int>(child_pid_));
             return;
         }
         if (result > 0 && WIFEXITED(status)) {
             RCLCPP_INFO(this->get_logger(),
-                "[RUN_MISSION] ✅ missao_P_T (PID %d) finalizado com código %d.",
-                static_cast<int>(child_pid_), WEXITSTATUS(status));
+                "[RUN_MISSION] ✅ %s (PID %d) finalizado com código %d.",
+                current_child_exec_.c_str(), static_cast<int>(child_pid_),
+                WEXITSTATUS(status));
         } else {
             RCLCPP_WARN(this->get_logger(),
-                "[RUN_MISSION] ⚠️  missao_P_T (PID %d) encerrou de forma anormal.",
-                static_cast<int>(child_pid_));
+                "[RUN_MISSION] ⚠️  %s (PID %d) encerrou de forma anormal.",
+                current_child_exec_.c_str(), static_cast<int>(child_pid_));
         }
         child_pid_ = -1;
 
@@ -378,7 +400,8 @@ private:
         post_reset_ticks_ = POST_RESET_COOLDOWN_TICKS;
         state_ = SupervisorState::WAIT_TRAJ;
         RCLCPP_INFO(this->get_logger(),
-            "[WAIT_TRAJ] missao_P_T concluído. Aguardando próxima trajetória…");
+            "[WAIT_TRAJ] %s concluído. Aguardando próxima trajetória…",
+            current_child_exec_.c_str());
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────
@@ -431,6 +454,10 @@ private:
     bool        odom_received_;
     double      current_x_;
     double      current_y_;
+
+    // Mission launch policy
+    bool        use_origin_as_base_;      // param: gate pouso on proximity to origin
+    std::string current_child_exec_;      // name of the executable currently running in RUN_MISSION
 };
 
 int main(int argc, char ** argv) {
