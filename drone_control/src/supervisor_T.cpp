@@ -86,6 +86,9 @@ public:
         mission_cycle_done_pub_ = this->create_publisher<std_msgs::msg::Bool>(
             "/mission_cycle_done", 10);
 
+        yaw_scan_done_pub_ = this->create_publisher<std_msgs::msg::Bool>(
+            "/yaw_scan_done", 10);
+
         odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
             "/" + uav_name_ + "/mavros/local_position/odom", 10,
             std::bind(&SupervisorTNode::odom_callback, this, std::placeholders::_1));
@@ -270,6 +273,16 @@ private:
         child_pid_ = -1;
         reset_trajectory_guards();
         post_reset_ticks_ = POST_RESET_COOLDOWN_TICKS;
+
+        // Signal the Python waypoint supervisor that the initial 360° scan is done.
+        {
+            std_msgs::msg::Bool scan_done;
+            scan_done.data = true;
+            yaw_scan_done_pub_->publish(scan_done);
+            RCLCPP_INFO(this->get_logger(),
+                "[RUN_YAW] 📢 /yaw_scan_done=true publicado.");
+        }
+
         state_ = SupervisorState::WAIT_TRAJ;
         RCLCPP_INFO(this->get_logger(),
             "[WAIT_TRAJ] Monitorando /trajectory_progress e /trajectory_finished…");
@@ -403,6 +416,7 @@ private:
     rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr  progress_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr     finished_sub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr        mission_cycle_done_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr        yaw_scan_done_pub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::TimerBase::SharedPtr                             fsm_timer_;
 
