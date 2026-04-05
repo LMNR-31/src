@@ -179,9 +179,15 @@ class YoloPadPose(Node):
 def main():
     rclpy.init()
     node = YoloPadPose()
+    node.get_logger().info("yolo_pad_pose node started.")
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
