@@ -7,9 +7,10 @@ from typing import List, Optional, Tuple
 import rclpy
 from rclpy.node import Node
 
-from geometry_msgs.msg import Pose, PoseArray, PointStamped
+from geometry_msgs.msg import PointStamped
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, Int32
+from drone_control.msg import Waypoint4D, Waypoint4DArray
 
 
 def yaw_from_quat(x: float, y: float, z: float, w: float) -> float:
@@ -32,7 +33,9 @@ class PadWaypointSupervisor(Node):
     """
     Subscribes to YOLO detections from front+down cameras (optical frame points),
     converts to right/front, projects to map using odom yaw, deduplicates bases,
-    and publishes /waypoints (PoseArray) with 2 poses: current + target (z fixed).
+    and publishes /waypoints_4d (Waypoint4DArray) with 2 waypoints: current + target
+    (z fixed). The target waypoint encodes an explicit yaw pointing toward the
+    detected H pad center so the drone faces the base on arrival.
     """
 
     def __init__(self):
@@ -42,7 +45,7 @@ class PadWaypointSupervisor(Node):
         self.declare_parameter("odom_topic", "/uav1/mavros/local_position/odom")
         self.declare_parameter("front_det_topic", "/landing_pad/front_optical_point")
         self.declare_parameter("down_det_topic", "/landing_pad/down_optical_point")
-        self.declare_parameter("waypoints_topic", "/waypoints")
+        self.declare_parameter("waypoints_topic", "/waypoints_4d")
 
         self.declare_parameter("trajectory_finished_topic", "/trajectory_finished")
         self.declare_parameter("use_trajectory_finished", True)
@@ -51,7 +54,7 @@ class PadWaypointSupervisor(Node):
         self.declare_parameter("scan_duration_s", 35.0)   # fallback: auto-advance SCAN after this many seconds
         self.declare_parameter("controller_state_topic", "/drone_controller/state_voo")
 
-        self.declare_parameter("map_frame", "uav1/map")     # used in PoseArray.header.frame_id
+        self.declare_parameter("map_frame", "uav1/map")     # used in Waypoint4DArray.header.frame_id
         self.declare_parameter("z_fixed", 1.5)
         self.declare_parameter("bases_to_visit", 6)
 
@@ -147,7 +150,7 @@ class PadWaypointSupervisor(Node):
             ),
         )
 
-        self.pub_waypoints = self.create_publisher(PoseArray, self.waypoints_topic, 10)
+        self.pub_waypoints = self.create_publisher(Waypoint4DArray, self.waypoints_topic, 10)
 
         self.timer = self.create_timer(self.publish_period_s, self.tick)
 
@@ -330,24 +333,27 @@ class PadWaypointSupervisor(Node):
                 c.visited = True
 
     def _publish_two_pose_waypoints(self, tx: float, ty: float):
-        pa = PoseArray()
-        pa.header.stamp = self.get_clock().now().to_msg()
-        pa.header.frame_id = self.map_frame
+        # Yaw at the target: point the drone toward the detected H center (base).
+        yaw_to_target = math.atan2(ty - self.cur_y, tx - self.cur_x)
 
-        p0 = Pose()
-        p0.position.x = float(self.cur_x)
-        p0.position.y = float(self.cur_y)
-        p0.position.z = float(self.z_fixed)
-        p0.orientation.w = 1.0
+        msg = Waypoint4DArray()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.map_frame
 
-        p1 = Pose()
-        p1.position.x = float(tx)
-        p1.position.y = float(ty)
-        p1.position.z = float(self.z_fixed)
-        p1.orientation.w = 1.0
+        wp0 = Waypoint4D()
+        wp0.pose.position.x = float(self.cur_x)
+        wp0.pose.position.y = float(self.cur_y)
+        wp0.pose.position.z = float(self.z_fixed)
+        wp0.yaw = float("nan")  # keep current heading for the first (origin) wp
 
-        pa.poses = [p0, p1]
-        self.pub_waypoints.publish(pa)
+        wp1 = Waypoint4D()
+        wp1.pose.position.x = float(tx)
+        wp1.pose.position.y = float(ty)
+        wp1.pose.position.z = float(self.z_fixed)
+        wp1.yaw = float(yaw_to_target)  # face the H pad center on arrival
+
+        msg.waypoints = [wp0, wp1]
+        self.pub_waypoints.publish(msg)
 
     def tick(self):
         if not self.have_odom:
