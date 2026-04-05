@@ -111,9 +111,8 @@ private:
     current_y_ = msg->pose.pose.position.y;
     current_z_ = msg->pose.pose.position.z;
     if (!odom_received_) {
-      home_x_   = current_x_;
-      home_y_   = current_y_;
-      home_set_ = true;
+      home_x_ = current_x_;
+      home_y_ = current_y_;
     }
     odom_received_ = true;
   }
@@ -194,7 +193,7 @@ private:
     double land_y;
     const char * xy_source;
 
-    if (use_home_xy_ && home_set_) {
+    if (use_home_xy_ && odom_received_) {
       land_x    = home_x_;
       land_y    = home_y_;
       xy_source = "home (primeira odom)";
@@ -291,7 +290,6 @@ private:
 
   bool   fcu_connected_ {false};
   bool   odom_received_ {false};
-  bool   home_set_      {false};
   double current_x_     {0.0};
   double current_y_     {0.0};
   double current_z_     {0.0};
