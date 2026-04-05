@@ -95,3 +95,5 @@ windows:
   # ── 9-10. Free terminals ───────────────────────────────────────────────────
   - terminal1:
   - terminal2:
+  - terminal3:
+  - terminal4: 
