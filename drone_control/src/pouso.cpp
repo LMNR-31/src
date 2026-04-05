@@ -5,14 +5,17 @@
 // then descends to ground level.
 //
 // Parameters
-//   uav_name        (string, default "uav1")    — UAV namespace prefix
-//   x               (double, default  0.0)      — target landing X (ENU, m)
-//   y               (double, default  0.0)      — target landing Y (ENU, m)
-//   use_current_xy  (bool,   default  true)     — ignore x/y and use live odom XY
-//   landing_z       (double, default  0.05)     — final ground altitude (m)
-//   frame_id        (string, default "map")     — coordinate frame
-//   rate_hz         (double, default  10.0)     — timer rate (Hz)
-//   check_after_sec (double, default  15.0)     — seconds before giving up
+//   uav_name         (string, default "uav1")     — UAV namespace prefix
+//   x                (double, default  0.0)       — target landing X (ENU, m)
+//   y                (double, default  0.0)       — target landing Y (ENU, m)
+//   use_home_xy      (bool,   default  true)      — use the initial odom XY as home (H)
+//   use_current_xy   (bool,   default  false)     — ignore x/y and use live odom XY
+//   enable_auto_land (bool,   default  false)     — command AUTO.LAND via MAVROS SetMode
+//   landing_z        (double, default  0.05)      — final ground altitude (m)
+//   frame_id         (string, default "uav1/map") — coordinate frame in /waypoints
+//   rate_hz          (double, default  10.0)      — timer rate (Hz)
+//   check_after_sec  (double, default  15.0)      — seconds before giving up
+//   xy_hold_tol      (double, default  0.05)      — require XY error <= tol for precise landing
 //
 // Published topics
 //   /waypoints  [geometry_msgs/PoseArray]   — consumed by my_drone_controller
@@ -24,6 +27,7 @@
 #include <mavros_msgs/msg/state.hpp>
 #include <mavros_msgs/srv/set_mode.hpp>
 #include <chrono>
+#include <cmath>
 
 using namespace std::chrono_literals;
 using std::placeholders::_1;
@@ -39,23 +43,36 @@ public:
     attempt_start_(rclcpp::Time(0, 0, RCL_ROS_TIME))
   {
     // ── parameters ──────────────────────────────────────────────────────────
-    this->declare_parameter<std::string>("uav_name",        "uav1");
-    this->declare_parameter<double>     ("x",               0.0);
-    this->declare_parameter<double>     ("y",               0.0);
-    this->declare_parameter<bool>       ("use_current_xy",  true);
-    this->declare_parameter<double>     ("landing_z",       0.05);
-    this->declare_parameter<std::string>("frame_id",        "map");
-    this->declare_parameter<double>     ("rate_hz",         10.0);
-    this->declare_parameter<double>     ("check_after_sec", 15.0);
+    this->declare_parameter<std::string>("uav_name",         "uav1");
+    this->declare_parameter<double>     ("x",                0.0);
+    this->declare_parameter<double>     ("y",                0.0);
 
-    uav_name_        = this->get_parameter("uav_name").as_string();
-    target_x_        = this->get_parameter("x").as_double();
-    target_y_        = this->get_parameter("y").as_double();
-    use_current_xy_  = this->get_parameter("use_current_xy").as_bool();
-    landing_z_       = this->get_parameter("landing_z").as_double();
-    frame_id_        = this->get_parameter("frame_id").as_string();
-    check_after_sec_ = this->get_parameter("check_after_sec").as_double();
-    double rate_hz   = this->get_parameter("rate_hz").as_double();
+    // New defaults: precise landing at home (H) unless user overrides.
+    this->declare_parameter<bool>       ("use_home_xy",      true);
+    this->declare_parameter<bool>       ("use_current_xy",   false);
+
+    // AUTO.LAND is optional; default off to keep XY precision by waypoint control.
+    this->declare_parameter<bool>       ("enable_auto_land", false);
+
+    this->declare_parameter<double>     ("landing_z",        0.05);
+    this->declare_parameter<std::string>("frame_id",         "uav1/map");
+    this->declare_parameter<double>     ("rate_hz",          10.0);
+    this->declare_parameter<double>     ("check_after_sec",  15.0);
+
+    // New: hold XY precision
+    this->declare_parameter<double>     ("xy_hold_tol",      0.05);
+
+    uav_name_         = this->get_parameter("uav_name").as_string();
+    target_x_         = this->get_parameter("x").as_double();
+    target_y_         = this->get_parameter("y").as_double();
+    use_home_xy_      = this->get_parameter("use_home_xy").as_bool();
+    use_current_xy_   = this->get_parameter("use_current_xy").as_bool();
+    enable_auto_land_ = this->get_parameter("enable_auto_land").as_bool();
+    landing_z_        = this->get_parameter("landing_z").as_double();
+    frame_id_         = this->get_parameter("frame_id").as_string();
+    check_after_sec_  = this->get_parameter("check_after_sec").as_double();
+    xy_hold_tol_      = this->get_parameter("xy_hold_tol").as_double();
+    double rate_hz    = this->get_parameter("rate_hz").as_double();
 
     // ── publisher / subscribers ──────────────────────────────────────────────
     waypoints_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>("/waypoints", 10);
@@ -77,16 +94,18 @@ public:
       period_ms, std::bind(&PousoNode::timerCallback, this));
 
     RCLCPP_INFO(this->get_logger(),
-      "pouso node started. uav=%s landing_z=%.2f use_current_xy=%s "
-      "target=(%.2f, %.2f) check_after=%.1fs",
-      uav_name_.c_str(), landing_z_,
+      "pouso node started. uav=%s landing_z=%.2f frame_id=%s "
+      "use_home_xy=%s use_current_xy=%s enable_auto_land=%s "
+      "target=(%.2f, %.2f) xy_hold_tol=%.3f check_after=%.1fs",
+      uav_name_.c_str(), landing_z_, frame_id_.c_str(),
+      use_home_xy_ ? "true" : "false",
       use_current_xy_ ? "true" : "false",
-      target_x_, target_y_, check_after_sec_);
+      enable_auto_land_ ? "true" : "false",
+      target_x_, target_y_, xy_hold_tol_, check_after_sec_);
   }
 
 private:
-  // ── callbacks ──────────────────────────────────────────────────────────────
-
+  // ── callbacks ─────────────────────────────────────────────────────────────
   void stateCallback(const mavros_msgs::msg::State::SharedPtr msg)
   {
     fcu_connected_ = msg->connected;
@@ -97,11 +116,20 @@ private:
     current_x_ = msg->pose.pose.position.x;
     current_y_ = msg->pose.pose.position.y;
     current_z_ = msg->pose.pose.position.z;
+
+    if (!home_set_) {
+      home_x_ = current_x_;
+      home_y_ = current_y_;
+      home_set_ = true;
+      RCLCPP_INFO(this->get_logger(),
+        "🏠 Home (H) capturado da primeira odometria: X=%.2f Y=%.2f (frame odom)",
+        home_x_, home_y_);
+    }
+
     odom_received_ = true;
   }
 
-  // ── FSM timer ──────────────────────────────────────────────────────────────
-
+  // ── FSM timer ─────────────────────────────────────────────────────────────
   void timerCallback()
   {
     switch (fsm_) {
@@ -122,6 +150,11 @@ private:
             "Aguardando odometria antes de publicar ponto de pouso…");
           return;
         }
+        if (use_home_xy_ && !home_set_) {
+          RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "Aguardando capturar home (H) da primeira odometria…");
+          return;
+        }
         RCLCPP_INFO(this->get_logger(),
           "Odometria recebida. Posição atual: X=%.2f Y=%.2f Z=%.2f",
           current_x_, current_y_, current_z_);
@@ -129,7 +162,12 @@ private:
         break;
 
       case PousoFSM::PUBLISH:
-        callAutoLand();
+        if (enable_auto_land_) {
+          callAutoLand();
+        } else {
+          RCLCPP_INFO(this->get_logger(),
+            "AUTO.LAND desabilitado (enable_auto_land=false). Usando apenas /waypoints para pouso preciso.");
+        }
         publishLandingWaypoints();
         attempt_start_ = this->now();
         fsm_ = PousoFSM::MONITOR;
@@ -141,8 +179,7 @@ private:
     }
   }
 
-  // ── helpers ────────────────────────────────────────────────────────────────
-
+  // ── helpers ───────────────────────────────────────────────────────────────
   void callAutoLand()
   {
     if (!set_mode_client_->wait_for_service(std::chrono::seconds(3))) {
@@ -168,10 +205,30 @@ private:
       });
   }
 
+  void resolveLandingXY(double & land_x, double & land_y, const char *& source) const
+  {
+    if (use_home_xy_ && home_set_) {
+      land_x = home_x_;
+      land_y = home_y_;
+      source = "home (H) da primeira odometria";
+      return;
+    }
+    if (use_current_xy_) {
+      land_x = current_x_;
+      land_y = current_y_;
+      source = "odometria atual";
+      return;
+    }
+    land_x = target_x_;
+    land_y = target_y_;
+    source = "parâmetros x/y";
+  }
+
   void publishLandingWaypoints()
   {
-    double land_x = use_current_xy_ ? current_x_ : target_x_;
-    double land_y = use_current_xy_ ? current_y_ : target_y_;
+    double land_x = 0.0, land_y = 0.0;
+    const char * src = "unknown";
+    resolveLandingXY(land_x, land_y, src);
 
     geometry_msgs::msg::PoseArray waypoints;
     waypoints.header.frame_id = frame_id_;
@@ -185,7 +242,7 @@ private:
     wp_approach.orientation.w = 1.0;
     waypoints.poses.push_back(wp_approach);
 
-    // WP 2 — descend to ground level
+    // WP 2 — descend to ground level (same XY)
     geometry_msgs::msg::Pose wp_ground;
     wp_ground.position.x    = land_x;
     wp_ground.position.y    = land_y;
@@ -196,29 +253,45 @@ private:
     waypoints_pub_->publish(waypoints);
 
     RCLCPP_INFO(this->get_logger(),
-      "🛬 Ponto de pouso publicado em /waypoints:");
+      "🛬 Waypoints de pouso publicados em /waypoints:");
     RCLCPP_INFO(this->get_logger(),
-      "   Posição XY: (%.2f, %.2f) [fonte: %s]",
-      land_x, land_y,
-      use_current_xy_ ? "odometria atual" : "parâmetros x/y");
+      "   frame_id=%s | XY alvo: (%.3f, %.3f) [fonte: %s] | xy_hold_tol=%.3f",
+      frame_id_.c_str(), land_x, land_y, src, xy_hold_tol_);
     RCLCPP_INFO(this->get_logger(),
-      "   WP[0]: X=%.2f Y=%.2f Z=%.2f (hover de aproximação)",
+      "   WP[0]: X=%.3f Y=%.3f Z=%.3f (hover de aproximação)",
       wp_approach.position.x, wp_approach.position.y, wp_approach.position.z);
     RCLCPP_INFO(this->get_logger(),
-      "   WP[1]: X=%.2f Y=%.2f Z=%.2f (solo)",
+      "   WP[1]: X=%.3f Y=%.3f Z=%.3f (solo)",
       wp_ground.position.x, wp_ground.position.y, wp_ground.position.z);
   }
 
   void monitorLanding()
   {
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "⬇️  Descendo… altitude atual Z=%.2f m (alvo=%.2f m)",
-      current_z_, landing_z_);
+    double land_x = 0.0, land_y = 0.0;
+    const char * src = "unknown";
+    resolveLandingXY(land_x, land_y, src);
 
-    if (current_z_ <= landing_z_ + 0.15) {
+    const double dx = land_x - current_x_;
+    const double dy = land_y - current_y_;
+    const double dxy = std::hypot(dx, dy);
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+      "⬇️  Descendo… Z=%.2f (alvo=%.2f) | dXY=%.3f (tol=%.3f) | alvoXY=(%.2f, %.2f) [%s]",
+      current_z_, landing_z_, dxy, xy_hold_tol_, land_x, land_y, src);
+
+    // If we're drifting from the target XY, republish to pull back to center.
+    if (dxy > xy_hold_tol_) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "⚠️  Fora da tolerância XY (dXY=%.3f > %.3f). Republicando waypoints para recentrar no alvo.",
+        dxy, xy_hold_tol_);
+      publishLandingWaypoints();
+    }
+
+    // Landing complete only if close to ground AND within XY tolerance.
+    if ((current_z_ <= landing_z_ + 0.15) && (dxy <= xy_hold_tol_)) {
       RCLCPP_INFO(this->get_logger(),
-        "✅ Pouso concluído: Z=%.2f m ≤ %.2f m. Encerrando.",
-        current_z_, landing_z_ + 0.15);
+        "✅ Pouso concluído: Z=%.2f ≤ %.2f e dXY=%.3f ≤ %.3f. Encerrando.",
+        current_z_, landing_z_ + 0.15, dxy, xy_hold_tol_);
       rclcpp::shutdown();
       return;
     }
@@ -226,14 +299,13 @@ private:
     double elapsed = (this->now() - attempt_start_).seconds();
     if (elapsed >= check_after_sec_) {
       RCLCPP_WARN(this->get_logger(),
-        "⚠️  Timeout aguardando pouso (%.1fs): Z=%.2f m. Encerrando.",
-        check_after_sec_, current_z_);
+        "⚠️  Timeout aguardando pouso (%.1fs): Z=%.2f dXY=%.3f (tol=%.3f). Encerrando.",
+        check_after_sec_, current_z_, dxy, xy_hold_tol_);
       rclcpp::shutdown();
     }
   }
 
-  // ── state ──────────────────────────────────────────────────────────────────
-
+  // ── state ────────────────────────────────────────────────────────────────
   PousoFSM fsm_;
 
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr waypoints_pub_;
@@ -248,16 +320,24 @@ private:
   double current_y_     {0.0};
   double current_z_     {0.0};
 
+  // Home (H) = first odometry XY
+  bool   home_set_ {false};
+  double home_x_   {0.0};
+  double home_y_   {0.0};
+
   rclcpp::Time attempt_start_;
 
   // Parameters
   std::string uav_name_;
   double      target_x_;
   double      target_y_;
+  bool        use_home_xy_;
   bool        use_current_xy_;
+  bool        enable_auto_land_;
   double      landing_z_;
   std::string frame_id_;
   double      check_after_sec_;
+  double      xy_hold_tol_;
 };
 
 int main(int argc, char ** argv)
