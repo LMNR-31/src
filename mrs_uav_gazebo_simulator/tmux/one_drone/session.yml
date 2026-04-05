@@ -53,6 +53,17 @@ windows:
           /opt/ros/jazzy/lib/px4/px4 \
           ~/ros2_ws/install/mrs_uav_gazebo_simulator/share/mrs_uav_gazebo_simulator/ROMFS/px4fmu_common \
           -s etc/init.d-posix/rcS -i 1 -w /tmp/sitl_uav_1
+  - tf_fixes:
+      layout: tiled
+      panes:
+        - |
+          waitForGazebo; sleep 5
+          source ~/ros2_ws/install/setup.bash
+          ros2 launch drone_control tf_body_fallback.launch.py
+        - |
+          waitForGazebo; sleep 5
+          source ~/ros2_ws/install/setup.bash
+          ros2 launch drone_control tf_camera_static.launch.py
 
         
        
