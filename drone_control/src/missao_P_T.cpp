@@ -132,6 +132,7 @@ private:
     if (takeoff_result != 0) {
       RCLCPP_WARN(this->get_logger(),
         "⚠️  [FASE 3] takeoff encerrou com código %d.", takeoff_result);
+      exit_code_.store(1);
     } else {
       RCLCPP_INFO(this->get_logger(),
         "✅ [FASE 3] takeoff concluído com sucesso.");
@@ -142,10 +143,6 @@ private:
       "🏁 missao_P_T concluída. pouso=%s takeoff=%s",
       pouso_result   == 0 ? "OK" : "FALHOU",
       takeoff_result == 0 ? "OK" : "AVISO");
-
-    if (pouso_result != 0) {
-      exit_code_.store(1);
-    }
 
     rclcpp::shutdown();
   }

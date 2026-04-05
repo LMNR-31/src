@@ -371,6 +371,13 @@ class PadWaypointSupervisor(Node):
             )
             p1.orientation.z = qz1
             p1.orientation.w = qw1
+        elif self.aim_at_home and not self._have_home_from_odom:
+            self.get_logger().warning(
+                "[aim_at_home] Home position not yet captured from odom; "
+                "using identity orientation until first odom is received."
+            )
+            p0.orientation.w = 1.0
+            p1.orientation.w = 1.0
         else:
             p0.orientation.w = 1.0
             p1.orientation.w = 1.0
