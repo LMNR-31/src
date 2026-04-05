@@ -94,6 +94,7 @@ class PadWaypointSupervisor(Node):
         self.ready_for_commands = False
         self.state_voo = None           # controller state from /drone_controller/state_voo
         self._last_state_warn_t = 0.0   # for throttled warning when state != 2
+        self._last_zero_stamp_warn_t = 0.0  # for throttled warning on zero-stamp messages
 
         self.candidates: List[BaseCandidate] = []
         self.active_target: Optional[Tuple[float, float]] = None
@@ -180,6 +181,16 @@ class PadWaypointSupervisor(Node):
         #  - x ~ X_optical (right)
         #  - y ~ Y_optical (down)   [not used]
         #  - z ~ Z_optical (forward)
+
+        stamp = msg.header.stamp
+        if stamp.sec == 0 and stamp.nanosec == 0:
+            now_t = time.time()
+            if now_t - self._last_zero_stamp_warn_t >= 2.0:
+                self._last_zero_stamp_warn_t = now_t
+                self.get_logger().warning(
+                    f"[{source}] Received PointStamped with zero stamp; using current time as fallback."
+                )
+
         right = float(msg.point.x)
         front = float(msg.point.z)
 

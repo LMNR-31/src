@@ -61,8 +61,10 @@ class YoloPadPose(Node):
         self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(seconds=10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # Publisher
+        # Publishers
         self.pub = self.create_publisher(PointStamped, "/landing_pad/relative_position", 10)
+        self.pub_front = self.create_publisher(PointStamped, "/landing_pad/front_optical_point", 10)
+        self.pub_down = self.create_publisher(PointStamped, "/landing_pad/down_optical_point", 10)
 
         qos = rclpy.qos.qos_profile_sensor_data
 
@@ -164,12 +166,17 @@ class YoloPadPose(Node):
 
         out = PointStamped()
         out.header = p_base.header
+        out.header.stamp = self.get_clock().now().to_msg()
         out.header.frame_id = self.target_frame
         out.point.x = float(right)     # x = right (your convention)
         out.point.y = float(front)     # y = front
         out.point.z = float(self.fixed_z)
 
         self.pub.publish(out)
+        if source == "front":
+            self.pub_front.publish(out)
+        elif source == "down":
+            self.pub_down.publish(out)
 
         self.get_logger().info(
             f"[{source}] conf={conf:.2f} right(x)={out.point.x:.2f}m front(y)={out.point.y:.2f}m depthZ={Z:.2f}m"
