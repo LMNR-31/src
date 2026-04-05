@@ -63,6 +63,9 @@ class PadWaypointSupervisor(Node):
         self.declare_parameter("reach_tol_m", 0.6)           # consider reached when within this XY distance
         self.declare_parameter("home_x", 0.0)
         self.declare_parameter("home_y", 0.0)
+        self.declare_parameter("use_home_xy", True)          # forwarded to pouso: use initial odom XY as home
+        self.declare_parameter("enable_auto_land", False)    # forwarded to pouso: call AUTO.LAND mode
+        self.declare_parameter("xy_hold_tol", 0.05)          # forwarded to pouso: XY tolerance for landing (m)
 
         self.odom_topic = self.get_parameter("odom_topic").value
         self.front_det_topic = self.get_parameter("front_det_topic").value
@@ -88,6 +91,9 @@ class PadWaypointSupervisor(Node):
         self.reach_tol_m = float(self.get_parameter("reach_tol_m").value)
         self.home_x = float(self.get_parameter("home_x").value)
         self.home_y = float(self.get_parameter("home_y").value)
+        self.use_home_xy = bool(self.get_parameter("use_home_xy").value)
+        self.enable_auto_land = bool(self.get_parameter("enable_auto_land").value)
+        self.xy_hold_tol = float(self.get_parameter("xy_hold_tol").value)
 
         # State
         self.have_odom = False
@@ -153,7 +159,9 @@ class PadWaypointSupervisor(Node):
             f" mission_cycle_done_topic={self.mission_cycle_done_topic}\n"
             f" map_frame={self.map_frame} z_fixed={self.z_fixed}\n"
             f" bases_to_visit={self.bases_to_visit}\n"
-            f" cluster_tol_m={self.cluster_tol_m} min_seen_count={self.min_seen_count}"
+            f" cluster_tol_m={self.cluster_tol_m} min_seen_count={self.min_seen_count}\n"
+            f" use_home_xy={self.use_home_xy} enable_auto_land={self.enable_auto_land}"
+            f" xy_hold_tol={self.xy_hold_tol}"
         )
 
     def cb_finished(self, msg: Bool):
