@@ -60,7 +60,7 @@ max_bases          int   6        Total number of landing pads to visit.
 fixed_z            float 1.5      Fixed flight altitude [m].
 cluster_tol        float 1.0      Radius within which detections belong to the
                                   same candidate base [m].
-min_sep            float 0.8      Minimum separation between accepted distinct
+min_sep            float 1.0      Minimum separation between accepted distinct
                                   bases [m]. Must be >= cluster_tol.
 max_approach_dist  float 30.0     Maximum distance at which a candidate will be
                                   selected as next target [m].
@@ -128,7 +128,7 @@ class YoloMissionController(Node):
         self.declare_parameter("max_bases", 6)
         self.declare_parameter("fixed_z", 1.5)
         self.declare_parameter("cluster_tol", 1.0)
-        self.declare_parameter("min_sep", 0.8)
+        self.declare_parameter("min_sep", 1.0)
         self.declare_parameter("max_approach_dist", 30.0)
         self.declare_parameter("build_period", 0.5)
         self.declare_parameter("detection_cooldown", 0.3)
@@ -396,12 +396,12 @@ class YoloMissionController(Node):
                 f"{len(self._candidates)}"
             )
 
-    def _pick_nearest_unvisited(self):
+    def _pick_nearest_unvisited(self) -> "tuple[int, float, float] | None":
         """Return (index, x, y) of nearest unvisited candidate, or None."""
         best = None
         best_dist = float("inf")
 
-        for i, (cx, cy, count) in enumerate(self._candidates):
+        for i, (cx, cy, _) in enumerate(self._candidates):
             if i in self._visited_indices:
                 continue
             dist = math.hypot(cx - self._odom_x, cy - self._odom_y)
