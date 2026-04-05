@@ -9,7 +9,7 @@ from rclpy.node import Node
 
 from geometry_msgs.msg import Pose, PoseArray, PointStamped
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32
 
 
 def yaw_from_quat(x: float, y: float, z: float, w: float) -> float:
@@ -46,6 +46,7 @@ class PadWaypointSupervisor(Node):
 
         self.declare_parameter("trajectory_finished_topic", "/trajectory_finished")
         self.declare_parameter("use_trajectory_finished", True)
+        self.declare_parameter("controller_state_topic", "/drone_controller/state_voo")
 
         self.declare_parameter("map_frame", "uav1/map")     # used in PoseArray.header.frame_id
         self.declare_parameter("z_fixed", 1.5)
@@ -67,6 +68,7 @@ class PadWaypointSupervisor(Node):
 
         self.trajectory_finished_topic = self.get_parameter("trajectory_finished_topic").value
         self.use_trajectory_finished = bool(self.get_parameter("use_trajectory_finished").value)
+        self.controller_state_topic = self.get_parameter("controller_state_topic").value
 
         self.map_frame = self.get_parameter("map_frame").value
         self.z_fixed = float(self.get_parameter("z_fixed").value)
@@ -90,6 +92,8 @@ class PadWaypointSupervisor(Node):
         self.trajectory_finished = False
         self._last_finished_msg_t = 0.0
         self.ready_for_commands = False
+        self.state_voo = None           # controller state from /drone_controller/state_voo
+        self._last_state_warn_t = 0.0   # for throttled warning when state != 2
 
         self.candidates: List[BaseCandidate] = []
         self.active_target: Optional[Tuple[float, float]] = None
@@ -106,6 +110,15 @@ class PadWaypointSupervisor(Node):
         else:
             self.sub_finished = None
 
+        self.sub_state_voo = self.create_subscription(
+            Int32, self.controller_state_topic, self.cb_state_voo,
+            rclpy.qos.QoSProfile(
+                depth=1,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+            ),
+        )
+
         self.pub_waypoints = self.create_publisher(PoseArray, self.waypoints_topic, 10)
 
         self.timer = self.create_timer(self.publish_period_s, self.tick)
@@ -116,6 +129,7 @@ class PadWaypointSupervisor(Node):
             f" front_det_topic={self.front_det_topic}\n"
             f" down_det_topic={self.down_det_topic}\n"
             f" waypoints_topic={self.waypoints_topic}\n"
+            f" controller_state_topic={self.controller_state_topic}\n"
             f" map_frame={self.map_frame} z_fixed={self.z_fixed}\n"
             f" bases_to_visit={self.bases_to_visit}\n"
             f" cluster_tol_m={self.cluster_tol_m} min_seen_count={self.min_seen_count}"
@@ -127,6 +141,9 @@ class PadWaypointSupervisor(Node):
         if msg.data and not self.ready_for_commands:
             self.ready_for_commands = True
             self.get_logger().info("[READY] Controller signaled /trajectory_finished. Enabling waypoint publishing.")
+
+    def cb_state_voo(self, msg: Int32):
+        self.state_voo = int(msg.data)
 
     def cb_odom(self, msg: Odometry):
         self.have_odom = True
@@ -146,6 +163,17 @@ class PadWaypointSupervisor(Node):
 
         # Do not accumulate candidates until the controller has signaled readiness
         if not self.ready_for_commands:
+            return
+
+        # Gate: only process detections when controller is in HOVER (state 2)
+        if self.state_voo != 2:
+            now = time.time()
+            if now - self._last_state_warn_t >= 2.0:
+                self._last_state_warn_t = now
+                self.get_logger().warning(
+                    f"[{source}] Detection received but controller state={self.state_voo}"
+                    " (need 2=HOVER). Ignoring."
+                )
             return
 
         # msg.point is in optical frame. Our detector currently publishes:
@@ -211,6 +239,12 @@ class PadWaypointSupervisor(Node):
                 c.visited = True
 
     def _publish_two_pose_waypoints(self, tx: float, ty: float):
+        if self.state_voo != 2:
+            self.get_logger().debug(
+                f"_publish_two_pose_waypoints skipped: state_voo={self.state_voo} (need 2=HOVER)"
+            )
+            return
+
         pa = PoseArray()
         pa.header.stamp = self.get_clock().now().to_msg()
         pa.header.frame_id = self.map_frame
