@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
           'yolo_pad_pose = yolo_pad_pose.yolo_pad_pose_ros2:main',
           'capture_dataset = dataset_capture.capture_dataset:main',
+          'pad_waypoint_supervisor = yolo_pad_pose.pad_waypoint_supervisor:main',
         ],
     },
 )
