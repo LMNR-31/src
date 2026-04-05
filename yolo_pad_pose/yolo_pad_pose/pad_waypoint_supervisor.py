@@ -100,6 +100,8 @@ class PadWaypointSupervisor(Node):
         self.cur_x = 0.0
         self.cur_y = 0.0
         self.cur_yaw = 0.0
+        # Home (H pad) coordinates: latched from first odom when use_home_xy=True.
+        self._home_latched = False
 
         self.trajectory_finished = False
         self._last_finished_msg_t = 0.0
@@ -203,6 +205,16 @@ class PadWaypointSupervisor(Node):
         self.cur_y = float(msg.pose.pose.position.y)
         q = msg.pose.pose.orientation
         self.cur_yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
+
+        # Latch first odom position as home (H pad) when use_home_xy is enabled.
+        if self.use_home_xy and not self._home_latched:
+            self.home_x = self.cur_x
+            self.home_y = self.cur_y
+            self._home_latched = True
+            self.get_logger().info(
+                f"[HOME] use_home_xy=True — home (H) latched from first odom: "
+                f"x={self.home_x:.3f} y={self.home_y:.3f}"
+            )
 
         # Update map frame from odom if it looks namespaced (optional)
         if msg.header.frame_id:
