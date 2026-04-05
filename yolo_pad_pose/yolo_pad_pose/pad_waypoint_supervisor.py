@@ -47,6 +47,8 @@ class PadWaypointSupervisor(Node):
         self.declare_parameter("trajectory_finished_topic", "/trajectory_finished")
         self.declare_parameter("use_trajectory_finished", True)
         self.declare_parameter("mission_cycle_done_topic", "/mission_cycle_done")
+        self.declare_parameter("yaw_scan_done_topic", "/yaw_scan_done")
+        self.declare_parameter("scan_duration_s", 35.0)   # fallback: auto-advance SCAN after this many seconds
         self.declare_parameter("controller_state_topic", "/drone_controller/state_voo")
 
         self.declare_parameter("map_frame", "uav1/map")     # used in PoseArray.header.frame_id
@@ -70,6 +72,8 @@ class PadWaypointSupervisor(Node):
         self.trajectory_finished_topic = self.get_parameter("trajectory_finished_topic").value
         self.use_trajectory_finished = bool(self.get_parameter("use_trajectory_finished").value)
         self.mission_cycle_done_topic = self.get_parameter("mission_cycle_done_topic").value
+        self.yaw_scan_done_topic = self.get_parameter("yaw_scan_done_topic").value
+        self.scan_duration_s = float(self.get_parameter("scan_duration_s").value)
         self.controller_state_topic = self.get_parameter("controller_state_topic").value
 
         self.map_frame = self.get_parameter("map_frame").value
@@ -94,19 +98,21 @@ class PadWaypointSupervisor(Node):
         self.trajectory_finished = False
         self._last_finished_msg_t = 0.0
         self.mission_cycle_done = False
+        self.yaw_scan_done = False
+        self._scan_start_t = time.time()
         self.ready_for_commands = (not self.use_trajectory_finished)
         if self.ready_for_commands:
             self.get_logger().info("[READY] use_trajectory_finished=False, enabling waypoint publishing immediately.")
         else:
             self.get_logger().info("[WAIT] use_trajectory_finished=True, waiting for /trajectory_finished to enable waypoint publishing.")
         self.state_voo = None           # controller state from /drone_controller/state_voo
-        self._last_state_warn_t = 0.0   # for throttled warning when state != 2
+        self._last_state_warn_t = 0.0   # for throttled warning when state not in (2,3)
         self._last_zero_stamp_warn_t = 0.0  # for throttled warning on zero-stamp messages
 
         self.candidates: List[BaseCandidate] = []
         self.active_target: Optional[Tuple[float, float]] = None
         self.visited_count = 0
-        self.state = "DISCOVER"   # DISCOVER -> NAVIGATE -> WAIT_MISSION_DONE -> ... -> RETURN_HOME -> DONE
+        self.state = "SCAN"   # SCAN -> DISCOVER -> NAVIGATE -> WAIT_MISSION_DONE -> ... -> RETURN_HOME -> DONE
 
         # ROS I/O
         self.sub_odom = self.create_subscription(Odometry, self.odom_topic, self.cb_odom, 10)
@@ -120,6 +126,9 @@ class PadWaypointSupervisor(Node):
 
         self.sub_mission_cycle_done = self.create_subscription(
             Bool, self.mission_cycle_done_topic, self.cb_mission_cycle_done, 10)
+
+        self.sub_yaw_scan_done = self.create_subscription(
+            Bool, self.yaw_scan_done_topic, self.cb_yaw_scan_done, 10)
 
         self.sub_state_voo = self.create_subscription(
             Int32, self.controller_state_topic, self.cb_state_voo,
@@ -163,6 +172,20 @@ class PadWaypointSupervisor(Node):
                 f"[HANDSHAKE] /mission_cycle_done=true received but ignored (state={self.state})."
             )
 
+    def cb_yaw_scan_done(self, msg: Bool):
+        if msg.data and not self.yaw_scan_done:
+            self.yaw_scan_done = True
+            self.ready_for_commands = True
+            confirmed = [c for c in self.candidates if c.seen_count >= self.min_seen_count]
+            self.get_logger().info(
+                f"[SCAN] /yaw_scan_done=true — 360° scan complete. "
+                f"{len(confirmed)} confirmed base(s) discovered (of {len(self.candidates)} candidate(s)):"
+            )
+            for i, c in enumerate(confirmed):
+                self.get_logger().info(
+                    f"[SCAN]   base #{i}: map ({c.x:.2f}, {c.y:.2f}) m  seen={c.seen_count}"
+                )
+
     def cb_state_voo(self, msg: Int32):
         self.state_voo = int(msg.data)
 
@@ -182,18 +205,21 @@ class PadWaypointSupervisor(Node):
         if not self.have_odom:
             return
 
-        # Do not accumulate candidates until the controller has signaled readiness
-        if not self.ready_for_commands:
+        # Do not accumulate candidates until the controller has signaled readiness,
+        # except during the initial SCAN phase when we intentionally collect data.
+        if not self.ready_for_commands and self.state != "SCAN":
             return
 
-        # Gate: only process detections when controller is in HOVER (state 2)
-        if self.state_voo != 2:
+        # Gate on controller state: allow HOVER (2) and NAVIGATING (3).
+        # During the initial SCAN phase the drone is rotating in place (HOVER),
+        # so we skip the state gate entirely to ensure detections are captured.
+        if self.state not in ("SCAN",) and self.state_voo not in (2, 3):
             now = time.time()
             if now - self._last_state_warn_t >= 2.0:
                 self._last_state_warn_t = now
                 self.get_logger().warning(
                     f"[{source}] Detection received but controller state={self.state_voo}"
-                    " (need 2=HOVER). Ignoring."
+                    " (need 2=HOVER or 3=NAVIGATING). Ignoring."
                 )
             return
 
@@ -239,11 +265,13 @@ class PadWaypointSupervisor(Node):
     def _update_candidates(self, bx: float, by: float):
         now = time.time()
 
-        # Drop stale candidates
-        self.candidates = [
-            c for c in self.candidates
-            if (now - c.last_seen_s) <= self.candidate_timeout_s
-        ]
+        # Drop stale candidates — but NOT during the initial scan so that bases
+        # seen early in the 360° rotation aren't pruned before the scan ends.
+        if self.state != "SCAN":
+            self.candidates = [
+                c for c in self.candidates
+                if (now - c.last_seen_s) <= self.candidate_timeout_s
+            ]
 
         # Merge into existing if close
         for c in self.candidates:
@@ -306,6 +334,24 @@ class PadWaypointSupervisor(Node):
             return
 
         # State machine
+        if self.state == "SCAN":
+            # Collect detections passively while supervisor_T runs the yaw scan.
+            # Advance when /yaw_scan_done is received OR the fallback timer expires.
+            elapsed = time.time() - self._scan_start_t
+            scan_timed_out = self.scan_duration_s > 0 and elapsed >= self.scan_duration_s
+            if self.yaw_scan_done or scan_timed_out:
+                if scan_timed_out and not self.yaw_scan_done:
+                    self.get_logger().warning(
+                        f"[SCAN] Timeout ({elapsed:.1f}s) — /yaw_scan_done not received. "
+                        "Advancing to DISCOVER anyway.")
+                    self.ready_for_commands = True
+                confirmed = [c for c in self.candidates if c.seen_count >= self.min_seen_count]
+                self.get_logger().info(
+                    f"[SCAN→DISCOVER] {len(confirmed)} confirmed base(s) found. "
+                    "Starting mission sequencing.")
+                self.state = "DISCOVER"
+            return
+
         if self.state == "DISCOVER":
             if self.visited_count >= self.bases_to_visit:
                 self.get_logger().info("All bases visited. Switching to RETURN_HOME.")
