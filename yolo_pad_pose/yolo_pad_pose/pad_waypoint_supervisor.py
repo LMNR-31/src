@@ -89,6 +89,7 @@ class PadWaypointSupervisor(Node):
 
         self.trajectory_finished = False
         self._last_finished_msg_t = 0.0
+        self.ready_for_commands = False
 
         self.candidates: List[BaseCandidate] = []
         self.active_target: Optional[Tuple[float, float]] = None
@@ -123,6 +124,9 @@ class PadWaypointSupervisor(Node):
     def cb_finished(self, msg: Bool):
         self.trajectory_finished = bool(msg.data)
         self._last_finished_msg_t = time.time()
+        if msg.data and not self.ready_for_commands:
+            self.ready_for_commands = True
+            self.get_logger().info("[READY] Controller signaled /trajectory_finished. Enabling waypoint publishing.")
 
     def cb_odom(self, msg: Odometry):
         self.have_odom = True
@@ -138,6 +142,10 @@ class PadWaypointSupervisor(Node):
     def cb_det(self, msg: PointStamped, source: str):
         # Need odom to project to map
         if not self.have_odom:
+            return
+
+        # Do not accumulate candidates until the controller has signaled readiness
+        if not self.ready_for_commands:
             return
 
         # msg.point is in optical frame. Our detector currently publishes:
