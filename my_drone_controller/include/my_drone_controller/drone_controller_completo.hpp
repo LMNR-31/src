@@ -226,6 +226,11 @@ private:
   /// Heartbeat timer callback: periodically re-publishes trajectory_waypoints_ to /waypoints.
   void monitor_waypoints_heartbeat();
 
+  /// Heartbeat timer callback: periodically re-publishes /drone_controller/state_voo.
+  void monitor_state_voo_heartbeat();
+  /// Publishes state_voo_ immediately when it changes; call from control_loop().
+  void publish_state_voo_on_change();
+
   // ── Main control loop ────────────────────────────────────────────────────
   void control_loop();
 
@@ -283,6 +288,9 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr waypoint_goal_pub_;
   /// Publishes the currently stored trajectory waypoints for external monitoring.
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr waypoints_pub_;
+  /// Publishes the FSM state_voo_ integer so external nodes can gate on hover (state 2).
+  /// State meanings: 0=waiting waypoint, 1=takeoff, 2=hover, 3=trajectory, 4=landing.
+  rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr state_voo_pub_;
 
   // ── Subscribers ──────────────────────────────────────────────────────────
   rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr state_sub_;
@@ -309,6 +317,8 @@ private:
   rclcpp::TimerBase::SharedPtr monitor_waypoint_goal_timer_;
   /// Heartbeat timer for periodic /waypoints re-publish.
   rclcpp::TimerBase::SharedPtr monitor_waypoints_timer_;
+  /// Heartbeat timer for periodic /drone_controller/state_voo re-publish.
+  rclcpp::TimerBase::SharedPtr state_voo_timer_;
 
   // ── FCU state ────────────────────────────────────────────────────────────
   mavros_msgs::msg::State current_state_;
@@ -420,6 +430,12 @@ private:
   /// When true, heartbeat publishes are suppressed unless the drone is in flight
   /// or has an active goal/trajectory (avoids publishing stale data at idle).
   bool monitor_publish_only_when_active_{true};
+  /// When true (default), publish /drone_controller/state_voo.
+  bool publish_state_voo_{true};
+  /// Rate (Hz) at which /drone_controller/state_voo is periodically re-published.
+  double state_voo_pub_rate_hz_{1.0};
+  /// Last value of state_voo_ that was published; -1 means never published.
+  int last_published_state_voo_{-1};
 
   // ── Takeoff target altitude (latched) ────────────────────────────────────
   /// Fixed takeoff target altitude (metres) for the current climb.

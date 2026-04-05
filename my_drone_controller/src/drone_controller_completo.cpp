@@ -91,6 +91,14 @@ void DroneControllerCompleto::load_parameters()
     monitor_waypoint_goal_rate_hz_, monitor_waypoints_rate_hz_,
     monitor_publish_only_when_active_ ? "true" : "false");
 
+  this->declare_parameter<bool>  ("publish_state_voo", true);
+  this->declare_parameter<double>("state_voo_pub_rate_hz", 1.0);
+  publish_state_voo_      = this->get_parameter("publish_state_voo").as_bool();
+  state_voo_pub_rate_hz_  = this->get_parameter("state_voo_pub_rate_hz").as_double();
+  RCLCPP_INFO(this->get_logger(),
+    "⚙️  publish_state_voo=%s  state_voo_pub_rate_hz=%.1f",
+    publish_state_voo_ ? "true" : "false", state_voo_pub_rate_hz_);
+
   param_cb_handle_ = this->add_on_set_parameters_callback(
     std::bind(&DroneControllerCompleto::onSetParameters, this, std::placeholders::_1));
 
@@ -120,6 +128,8 @@ void DroneControllerCompleto::setup_publishers()
   waypoint_goal_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
     "/waypoint_goal", 10);
   waypoints_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>("/waypoints", 10);
+  state_voo_pub_ = this->create_publisher<std_msgs::msg::Int32>(
+    "/drone_controller/state_voo", rclcpp::QoS(1).transient_local());
   RCLCPP_INFO(this->get_logger(), "✓ Publisher criado: /uav1/mavros/setpoint_raw/local");
   RCLCPP_INFO(this->get_logger(), "✓ Publisher criado: /trajectory_finished");
   RCLCPP_INFO(this->get_logger(), "✓ Publisher criado: /trajectory_progress");
@@ -127,6 +137,7 @@ void DroneControllerCompleto::setup_publishers()
   RCLCPP_INFO(this->get_logger(), "✓ Publisher criado: /mission_latch_pose");
   RCLCPP_INFO(this->get_logger(), "✓ Publisher criado: /waypoint_goal");
   RCLCPP_INFO(this->get_logger(), "✓ Publisher criado: /waypoints");
+  RCLCPP_INFO(this->get_logger(), "✓ Publisher criado: /drone_controller/state_voo");
 }
 
 void DroneControllerCompleto::setup_subscribers()
@@ -221,6 +232,16 @@ void DroneControllerCompleto::setup_services()
       std::bind(&DroneControllerCompleto::monitor_waypoints_heartbeat, this));
     RCLCPP_INFO(this->get_logger(),
       "✓ Heartbeat /waypoints: %.1f Hz", monitor_waypoints_rate_hz_);
+  }
+  // ── State-voo periodic republish timer ────────────────────────────────────
+  if (publish_state_voo_ && state_voo_pub_rate_hz_ > 0.0) {
+    auto period_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(1.0 / state_voo_pub_rate_hz_));
+    state_voo_timer_ = this->create_wall_timer(
+      period_ns,
+      std::bind(&DroneControllerCompleto::monitor_state_voo_heartbeat, this));
+    RCLCPP_INFO(this->get_logger(),
+      "✓ Heartbeat /drone_controller/state_voo: %.1f Hz", state_voo_pub_rate_hz_);
   }
 }
 
@@ -1430,6 +1451,33 @@ void DroneControllerCompleto::monitor_waypoints_heartbeat()
     "[heartbeat /waypoints] %zu waypoints", trajectory_waypoints_.size());
 }
 
+void DroneControllerCompleto::monitor_state_voo_heartbeat()
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!publish_state_voo_) { return; }
+  std_msgs::msg::Int32 msg;
+  msg.data = state_voo_;
+  state_voo_pub_->publish(msg);
+  RCLCPP_DEBUG(this->get_logger(),
+    "[heartbeat /drone_controller/state_voo] state=%d", state_voo_);
+}
+
+void DroneControllerCompleto::publish_state_voo_on_change()
+{
+  // NOTE: This function is always called from control_loop(), which already
+  // holds mutex_. Do NOT acquire the mutex here to avoid a deadlock.
+  if (!publish_state_voo_) { return; }
+  if (state_voo_ == last_published_state_voo_) { return; }
+  std_msgs::msg::Int32 msg;
+  msg.data = state_voo_;
+  state_voo_pub_->publish(msg);
+  RCLCPP_INFO(this->get_logger(),
+    "📡 [/drone_controller/state_voo] state_voo_ mudou: %d → %d"
+    " (0=aguardando, 1=decolagem, 2=hover, 3=trajetória, 4=pouso)",
+    last_published_state_voo_, state_voo_);
+  last_published_state_voo_ = state_voo_;
+}
+
 // ============================================================
 // SETPOINT PUBLISHING
 // ============================================================
@@ -1570,6 +1618,9 @@ void DroneControllerCompleto::control_loop()
         "❌ Estado FSM inválido: %d", state_voo_);
       break;
   }
+
+  // Publish state_voo_ immediately whenever it changes.
+  publish_state_voo_on_change();
 }
 
 // ============================================================
