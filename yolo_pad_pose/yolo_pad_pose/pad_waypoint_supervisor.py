@@ -91,7 +91,11 @@ class PadWaypointSupervisor(Node):
 
         self.trajectory_finished = False
         self._last_finished_msg_t = 0.0
-        self.ready_for_commands = False
+        self.ready_for_commands = (not self.use_trajectory_finished)
+        if self.ready_for_commands:
+            self.get_logger().info("[READY] use_trajectory_finished=False, enabling waypoint publishing immediately.")
+        else:
+            self.get_logger().info("[WAIT] use_trajectory_finished=True, waiting for /trajectory_finished to enable waypoint publishing.")
         self.state_voo = None           # controller state from /drone_controller/state_voo
         self._last_state_warn_t = 0.0   # for throttled warning when state != 2
         self._last_zero_stamp_warn_t = 0.0  # for throttled warning on zero-stamp messages
@@ -192,7 +196,7 @@ class PadWaypointSupervisor(Node):
                 )
 
         right = float(msg.point.x)
-        front = float(msg.point.z)
+        front = float(msg.point.y)
 
         # Project to map (2D)
         yaw = self.cur_yaw
@@ -203,6 +207,18 @@ class PadWaypointSupervisor(Node):
         by = self.cur_y + dy_map
 
         self._update_candidates(bx, by)
+
+        now = time.time()
+        if not hasattr(self, "_last_det_info_t"):
+            self._last_det_info_t = 0.0
+        if now - self._last_det_info_t >= 1.0:
+            self._last_det_info_t = now
+            max_seen = max((c.seen_count for c in self.candidates), default=0)
+            self.get_logger().info(
+                f"[{source}] det ok: bx={bx:.2f} by={by:.2f} "
+                f"candidates={len(self.candidates)} max_seen={max_seen} "
+                f"state={self.state} state_voo={self.state_voo}"
+            )
 
     def _update_candidates(self, bx: float, by: float):
         now = time.time()
