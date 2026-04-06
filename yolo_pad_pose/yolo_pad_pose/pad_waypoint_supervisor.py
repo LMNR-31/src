@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import math
-import subprocess
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -8,6 +7,7 @@ from typing import List, Optional, Tuple
 import rclpy
 from rclpy.node import Node
 
+from drone_control.msg import YawOverride
 from geometry_msgs.msg import Pose, PoseArray, PointStamped
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, Int32
@@ -58,12 +58,12 @@ class PadWaypointSupervisor(Node):
         self.declare_parameter("z_fixed", 1.5)
         self.declare_parameter("bases_to_visit", 6)
 
-        self.declare_parameter("cluster_tol_m", 1.2)        # merge detections within this radius
+        self.declare_parameter("cluster_tol_m", 0.5)        # merge detections within this radius
         self.declare_parameter("min_seen_count", 6)         # require stable detection before accepting a base
         self.declare_parameter("candidate_timeout_s", 30.0) # drop candidates not seen recently
 
         self.declare_parameter("publish_period_s", 0.25)    # how often to republish target while navigating
-        self.declare_parameter("reach_tol_m", 0.6)           # consider reached when within this XY distance
+        self.declare_parameter("reach_tol_m", 0.1)           # consider reached when within this XY distance
         self.declare_parameter("home_x", 0.0)
         self.declare_parameter("home_y", 0.0)
         self.declare_parameter("repeat_block_m", 1.2)       # skip targets within this radius of any visited position
@@ -93,6 +93,11 @@ class PadWaypointSupervisor(Node):
         # "Lost" recovery: trigger yaw-360 scan if no valid candidate for this long
         self.declare_parameter("lost_timeout_s", 10.0)
         self.declare_parameter("yaw_scan_cooldown_s", 30.0)
+        # In-node yaw-override scan parameters
+        self.declare_parameter("yaw_override_topic", "/uav1/yaw_override/cmd")
+        self.declare_parameter("yaw_scan_rate_rad_s", 0.6)
+        self.declare_parameter("yaw_scan_publish_hz", 10.0)
+        self.declare_parameter("yaw_scan_duration_s", 0.0)  # 0 = auto: 2π/rate
 
         self.odom_topic = self.get_parameter("odom_topic").value
         self.base_det_topic = self.get_parameter("base_det_topic").value
@@ -135,6 +140,14 @@ class PadWaypointSupervisor(Node):
         self.max_jump_m = float(self.get_parameter("max_jump_m").value)
         self.lost_timeout_s = float(self.get_parameter("lost_timeout_s").value)
         self.yaw_scan_cooldown_s = float(self.get_parameter("yaw_scan_cooldown_s").value)
+        self.yaw_override_topic = self.get_parameter("yaw_override_topic").value
+        self.yaw_scan_rate_rad_s = float(self.get_parameter("yaw_scan_rate_rad_s").value)
+        self.yaw_scan_publish_hz = float(self.get_parameter("yaw_scan_publish_hz").value)
+        _yaw_scan_dur_param = float(self.get_parameter("yaw_scan_duration_s").value)
+        self._yaw_scan_dur_eff = (
+            _yaw_scan_dur_param if _yaw_scan_dur_param > 0.0
+            else (2.0 * math.pi / max(self.yaw_scan_rate_rad_s, 0.01))
+        )
 
         # State
         self.have_odom = False
@@ -185,7 +198,7 @@ class PadWaypointSupervisor(Node):
         # Lost-recovery state
         self._last_valid_candidate_t: float = time.monotonic()
         self._yaw_scan_active: bool = False
-        self._yaw_scan_proc: Optional[subprocess.Popen[bytes]] = None
+        self._yaw_scan_start_t: float = 0.0
         self._last_yaw_scan_t: float = 0.0
 
         # ROS I/O
@@ -223,8 +236,12 @@ class PadWaypointSupervisor(Node):
         )
 
         self.pub_waypoints = self.create_publisher(PoseArray, self.waypoints_topic, 10)
+        self.pub_yaw_override = self.create_publisher(
+            YawOverride, self.yaw_override_topic, 10)
 
         self.timer = self.create_timer(self.publish_period_s, self.tick)
+        self._yaw_override_timer = self.create_timer(
+            1.0 / self.yaw_scan_publish_hz, self._yaw_override_tick)
 
         self.get_logger().info(
             "pad_waypoint_supervisor started.\n"
@@ -249,7 +266,11 @@ class PadWaypointSupervisor(Node):
             f" max_detection_range_m={self.max_detection_range_m} "
             f"max_jump_m={self.max_jump_m}\n"
             f" lost_timeout_s={self.lost_timeout_s} "
-            f"yaw_scan_cooldown_s={self.yaw_scan_cooldown_s}"
+            f"yaw_scan_cooldown_s={self.yaw_scan_cooldown_s}\n"
+            f" yaw_override_topic={self.yaw_override_topic} "
+            f"yaw_scan_rate_rad_s={self.yaw_scan_rate_rad_s} "
+            f"yaw_scan_publish_hz={self.yaw_scan_publish_hz} "
+            f"yaw_scan_dur={self._yaw_scan_dur_eff:.1f}s"
         )
 
     def cb_finished(self, msg: Bool):
@@ -475,12 +496,13 @@ class PadWaypointSupervisor(Node):
     def _update_candidates(self, bx: float, by: float):
         now = time.time()
 
-        # Drop stale candidates — but NOT during the initial scan so that bases
+        # Drop stale unvisited candidates — but NOT during the initial scan so that bases
         # seen early in the 360° rotation aren't pruned before the scan ends.
+        # Visited candidates are always retained so the node remembers visited bases.
         if self.state != "SCAN":
             self.candidates = [
                 c for c in self.candidates
-                if (now - c.last_seen_s) <= self.candidate_timeout_s
+                if c.visited or (now - c.last_seen_s) <= self.candidate_timeout_s
             ]
 
         # Merge into existing if close
@@ -501,39 +523,46 @@ class PadWaypointSupervisor(Node):
         self._last_valid_candidate_t = time.monotonic()
 
     def _try_yaw_scan_recovery(self):
-        """Trigger a non-blocking yaw-360 recovery scan if not already scanning."""
+        """Trigger an in-node yaw-only 360 scan (yaw override) if not already scanning."""
         if self._yaw_scan_active:
+            return
+        # Only start scan when drone is in HOVER (state_voo == 2)
+        if self.state_voo != 2:
             return
         now = time.monotonic()
         if now - self._last_yaw_scan_t < self.yaw_scan_cooldown_s:
             return
+        self._yaw_scan_active = True
+        self._yaw_scan_start_t = now
+        self._last_yaw_scan_t = now
         self.get_logger().warning(
             "[LOST] No valid base candidate found for "
-            f"{self.lost_timeout_s:.1f}s — triggering yaw-360 recovery scan."
+            f"{self.lost_timeout_s:.1f}s — starting in-node yaw-360 scan "
+            f"(rate={self.yaw_scan_rate_rad_s:.2f}rad/s "
+            f"duration={self._yaw_scan_dur_eff:.1f}s)."
         )
-        try:
-            proc = subprocess.Popen(
-                ["ros2", "run", "drone_control", "drone_yaw_360"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self._yaw_scan_active = True
-            self._yaw_scan_proc = proc
-            self._last_yaw_scan_t = now
-            self.get_logger().info(
-                f"[LOST] drone_yaw_360 launched (pid={proc.pid})."
-            )
-        except Exception as exc:
-            self.get_logger().error(
-                f"[LOST] Failed to launch drone_yaw_360: {exc}"
-            )
+
+    def _yaw_override_tick(self):
+        """Publishes YawOverride commands at yaw_scan_publish_hz while scan is active."""
+        if not self._yaw_scan_active:
+            return
+        msg = YawOverride()
+        msg.enable = True
+        msg.yaw_rate = self.yaw_scan_rate_rad_s
+        msg.timeout = 2.0 / self.yaw_scan_publish_hz
+        self.pub_yaw_override.publish(msg)
 
     def _pick_next_target(self) -> Optional[Tuple[float, float]]:
         # Debug: log full candidate list each time we pick
         now = time.time()
+        confirmed = [c for c in self.candidates if c.seen_count >= self.min_seen_count]
+        visited_conf = [c for c in confirmed if c.visited]
+        unvisited_conf = [c for c in confirmed if not c.visited]
         self.get_logger().info(
-            f"[PICK] Candidate list ({len(self.candidates)} total, "
-            f"visited_positions={len(self.visited_positions)}):"
+            f"[PICK] bases confirmed={len(confirmed)} visited={len(visited_conf)} "
+            f"remaining={len(unvisited_conf)} "
+            f"(total_candidates={len(self.candidates)} "
+            f"visited_count={self.visited_count}/{self.bases_to_visit}):"
         )
         for i, c in enumerate(self.candidates):
             blocked = any(
@@ -674,20 +703,26 @@ class PadWaypointSupervisor(Node):
         if not self.have_odom:
             return
 
-        # Poll the yaw-scan subprocess to detect completion
-        if self._yaw_scan_active and self._yaw_scan_proc is not None:
-            ret = self._yaw_scan_proc.poll()
-            if ret is not None:
+        # Manage in-node yaw-360 scan lifecycle
+        if self._yaw_scan_active:
+            now_m = time.monotonic()
+            elapsed_scan = now_m - self._yaw_scan_start_t
+            confirmed_now = any(
+                c.seen_count >= self.min_seen_count for c in self.candidates
+            )
+            if elapsed_scan >= self._yaw_scan_dur_eff or confirmed_now:
                 self._yaw_scan_active = False
-                self._yaw_scan_proc = None
-                if ret == 0:
-                    self.get_logger().info("[LOST] drone_yaw_360 completed successfully.")
-                else:
-                    self.get_logger().warning(
-                        f"[LOST] drone_yaw_360 exited with code {ret}."
-                    )
-                # Reset lost timer so we don't immediately re-trigger
-                self._last_valid_candidate_t = time.monotonic()
+                stop_msg = YawOverride()
+                stop_msg.enable = False
+                stop_msg.yaw_rate = 0.0
+                stop_msg.timeout = 0.0
+                self.pub_yaw_override.publish(stop_msg)
+                self._last_valid_candidate_t = now_m
+                reason = "candidate found" if confirmed_now else f"duration {elapsed_scan:.1f}s"
+                self.get_logger().info(
+                    f"[LOST] Yaw-360 scan ended ({reason}). "
+                    f"confirmed={confirmed_now} candidates={len(self.candidates)}"
+                )
 
         # Update lost-timer whenever a confirmed candidate exists
         confirmed_any = any(
@@ -762,7 +797,16 @@ class PadWaypointSupervisor(Node):
                 return
 
             tx, ty = self.active_target
-            self._publish_two_pose_waypoints(tx, ty)
+            if self.state_voo in (2, 3):
+                self._publish_two_pose_waypoints(tx, ty)
+            else:
+                now = time.time()
+                if now - self._last_state_warn_t >= 5.0:
+                    self._last_state_warn_t = now
+                    self.get_logger().warning(
+                        f"[NAVIGATE] state_voo={self.state_voo} "
+                        "(need 2=HOVER or 3=NAVIGATING) — holding waypoint publish."
+                    )
 
             d = math.hypot(tx - self.cur_x, ty - self.cur_y)
             if d <= self.reach_tol_m:
@@ -804,7 +848,16 @@ class PadWaypointSupervisor(Node):
         if self.state == "RETURN_HOME":
             # publish until reached home, then DONE
             tx, ty = (self.home_x, self.home_y)
-            self._publish_two_pose_waypoints(tx, ty)
+            if self.state_voo in (2, 3):
+                self._publish_two_pose_waypoints(tx, ty)
+            else:
+                now = time.time()
+                if now - self._last_state_warn_t >= 5.0:
+                    self._last_state_warn_t = now
+                    self.get_logger().warning(
+                        f"[RETURN_HOME] state_voo={self.state_voo} "
+                        "(need 2=HOVER or 3=NAVIGATING) — holding waypoint publish."
+                    )
             d = math.hypot(tx - self.cur_x, ty - self.cur_y)
             if d <= self.reach_tol_m:
                 self.get_logger().info("Returned home. DONE.")
