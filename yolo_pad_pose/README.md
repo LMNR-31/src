@@ -116,7 +116,7 @@ ros2 run yolo_pad_pose pad_waypoint_supervisor --ros-args \
   -p enable_h_centering:=false
 ```
 
-
+### Outlier rejection and robustness parameters
 
 These parameters prevent phantom / noisy detections from polluting the
 candidate list and ensure the node does not revisit already-visited bases.
