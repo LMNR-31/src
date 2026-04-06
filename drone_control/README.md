@@ -115,7 +115,7 @@ ros2 run drone_control pouso --ros-args \
 | `check_after_sec` | `15.0`  | Overall timeout (s) before giving up |
 | `xy_hold_tol`     | `0.10`  | Max planar error (m) to be considered centred |
 | `xy_hold_stable_s`| `1.0`   | Seconds to remain within `xy_hold_tol` before starting descent |
-| `xy_abort_tol`    | `0.5`   | Abort descent and recenter if XY error exceeds this (m) |
+| `xy_abort_tol`    | `0.5`   | Abort descent and recentre if XY error exceeds this (m) |
 | `approach_z`      | `-1.0`  | Hover altitude for CENTER phase (m); `-1` = use current odom Z |
 | `use_yolo_h`      | `false` | Use YOLO-detected H marker as landing target |
 | `h_topic`         | `/landing_pad/h_relative_position` | YOLO H detection topic |
@@ -128,7 +128,7 @@ ros2 run drone_control pouso --ros-args \
 
 | Message | Meaning |
 |---------|---------|
-| `🎯 Entrando em CENTER: dxy=X.XX m …` | Entering CENTER phase (also on abort/recenter) |
+| `🎯 Entrando em CENTER: dxy=X.XX m …` | Entering CENTER phase (also on abort/recentre) |
 | `🎯 CENTER: dxy=X.XX m …` | Periodic status during centering |
 | `✅ Centrado: dxy=… por Y.Ys. Iniciando descida…` | Stable centering achieved; transitioning to DESCEND |
 | `⬇️  DESCEND: Z=…` | Periodic status during descent |

@@ -134,7 +134,7 @@ public:
 
     std::string approach_z_str = (approach_z_param_ >= 0.0)
       ? (std::to_string(approach_z_param_) + "m")
-      : std::string("auto(odom)");
+      : "auto(odom)";
     RCLCPP_INFO(this->get_logger(),
       "pouso node started. uav=%s landing_z=%.2f use_current_xy=%s "
       "target=(%.2f, %.2f) check_after=%.1fs "
@@ -344,9 +344,16 @@ private:
     // Determine approach altitude: use param if set, else use current odom Z.
     approach_z_ = (approach_z_param_ >= 0.0) ? approach_z_param_ : current_z_;
 
-    const char * fonte = use_yolo_h_ && has_best_h_
-      ? "yolo-H"
-      : (use_current_xy_ ? "odometria atual" : "parâmetros x/y");
+    const char * fonte;
+    if (use_yolo_h_ && has_best_h_) {
+      fonte = "yolo-H";
+    } else if (use_yolo_h_) {
+      fonte = "fallback-odom (yolo-H sem detecção)";
+    } else if (use_current_xy_) {
+      fonte = "odometria atual";
+    } else {
+      fonte = "parâmetros x/y";
+    }
     RCLCPP_INFO(this->get_logger(),
       "🛬 Ponto de pouso: XY=(%.2f, %.2f) [fonte: %s] | approach_z=%.2f m | landing_z=%.2f m",
       active_land_x_, active_land_y_, fonte, approach_z_, landing_z_);
