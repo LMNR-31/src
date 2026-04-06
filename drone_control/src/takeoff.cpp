@@ -18,7 +18,7 @@ public:
   {
     // Parameters
     this->declare_parameter<std::string>("uav_name", "uav1");
-    this->declare_parameter<double>("takeoff_altitude", 1.5);
+    this->declare_parameter<double>("takeoff_altitude", 2.0);
     this->declare_parameter<double>("altitude_threshold", -1.0);  // <0 → use takeoff_altitude - 0.3
     this->declare_parameter<bool>("use_current_xy", true);
     this->declare_parameter<double>("x", 0.0);
