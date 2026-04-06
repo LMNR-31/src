@@ -65,6 +65,9 @@ class PadWaypointSupervisor(Node):
         self.declare_parameter("home_y", 0.0)
         self.declare_parameter("repeat_block_m", 1.2)       # skip targets within this radius of any visited position
         self.declare_parameter("aim_at_home", False)        # orient waypoints to face toward home
+        self.declare_parameter("aim_at_h", True)            # orient waypoints to face toward detected H marker
+        self.declare_parameter("h_det_topic", "/landing_pad/h_relative_position")
+        self.declare_parameter("h_timeout_s", 3.0)          # discard H position if older than this
 
         self.odom_topic = self.get_parameter("odom_topic").value
         self.front_det_topic = self.get_parameter("front_det_topic").value
@@ -92,6 +95,9 @@ class PadWaypointSupervisor(Node):
         self.home_y = float(self.get_parameter("home_y").value)
         self.repeat_block_m = float(self.get_parameter("repeat_block_m").value)
         self.aim_at_home = bool(self.get_parameter("aim_at_home").value)
+        self.aim_at_h = bool(self.get_parameter("aim_at_h").value)
+        self.h_det_topic = self.get_parameter("h_det_topic").value
+        self.h_timeout_s = float(self.get_parameter("h_timeout_s").value)
 
         # State
         self.have_odom = False
@@ -124,10 +130,17 @@ class PadWaypointSupervisor(Node):
         self._home_from_odom_x = 0.0
         self._home_from_odom_y = 0.0
 
+        # Latest H-marker position received in base_link frame (right, front) + timestamp
+        self._h_right: float = 0.0
+        self._h_front: float = 0.0
+        self._h_last_t: float = 0.0   # monotonic time of last H detection
+
         # ROS I/O
         self.sub_odom = self.create_subscription(Odometry, self.odom_topic, self.cb_odom, 10)
         self.sub_front = self.create_subscription(PointStamped, self.front_det_topic, lambda m: self.cb_det(m, "front"), 10)
         self.sub_down = self.create_subscription(PointStamped, self.down_det_topic, lambda m: self.cb_det(m, "down"), 10)
+        self.sub_h_det = self.create_subscription(
+            PointStamped, self.h_det_topic, self.cb_h_det, 10)
 
         if self.use_trajectory_finished:
             self.sub_finished = self.create_subscription(Bool, self.trajectory_finished_topic, self.cb_finished, 10)
@@ -158,6 +171,7 @@ class PadWaypointSupervisor(Node):
             f" odom_topic={self.odom_topic}\n"
             f" front_det_topic={self.front_det_topic}\n"
             f" down_det_topic={self.down_det_topic}\n"
+            f" h_det_topic={self.h_det_topic} aim_at_h={self.aim_at_h} h_timeout_s={self.h_timeout_s}\n"
             f" waypoints_topic={self.waypoints_topic}\n"
             f" controller_state_topic={self.controller_state_topic}\n"
             f" mission_cycle_done_topic={self.mission_cycle_done_topic}\n"
@@ -220,8 +234,13 @@ class PadWaypointSupervisor(Node):
         if msg.header.frame_id:
             self.map_frame = msg.header.frame_id
 
+    def cb_h_det(self, msg: PointStamped):
+        """Store the latest H-marker relative position (right=x, front=y in base_link)."""
+        self._h_right = float(msg.point.x)
+        self._h_front = float(msg.point.y)
+        self._h_last_t = time.monotonic()
+
     def cb_det(self, msg: PointStamped, source: str):
-        # Need odom to project to map
         if not self.have_odom:
             return
 
@@ -308,6 +327,21 @@ class PadWaypointSupervisor(Node):
         self.candidates.append(BaseCandidate(x=bx, y=by, last_seen_s=now, seen_count=1))
 
     def _pick_next_target(self) -> Optional[Tuple[float, float]]:
+        # Debug: log full candidate list each time we pick
+        self.get_logger().info(
+            f"[PICK] Candidate list ({len(self.candidates)} total, "
+            f"visited_positions={len(self.visited_positions)}):"
+        )
+        for i, c in enumerate(self.candidates):
+            blocked = any(
+                math.hypot(c.x - vx, c.y - vy) <= self.repeat_block_m
+                for vx, vy in self.visited_positions
+            )
+            self.get_logger().info(
+                f"[PICK]   #{i}: map=({c.x:.2f},{c.y:.2f}) "
+                f"seen={c.seen_count} visited={c.visited} blocked={blocked}"
+            )
+
         # Choose nearest unvisited candidate with enough evidence
         best = None
         best_d = None
@@ -329,6 +363,10 @@ class PadWaypointSupervisor(Node):
                 best_d = d
         if best is None:
             return None
+        self.get_logger().info(
+            f"[PICK] Selected: map=({best.x:.2f},{best.y:.2f}) "
+            f"seen={best.seen_count} dist={best_d:.2f}m"
+        )
         return (best.x, best.y)
 
     def _mark_visited(self, x: float, y: float):
@@ -358,7 +396,33 @@ class PadWaypointSupervisor(Node):
         p1.position.y = float(ty)
         p1.position.z = float(self.z_fixed)
 
-        if self.aim_at_home and self._have_home_from_odom:
+        # Determine orientation: aim_at_h takes priority over aim_at_home.
+        h_fresh = (time.monotonic() - self._h_last_t) <= self.h_timeout_s
+        if self.aim_at_h and h_fresh:
+            # Project H relative position (right, front in base_link) to map frame
+            # using the current drone yaw — same projection used for base candidates.
+            yaw = self.cur_yaw
+            h_dx = self._h_front * math.cos(yaw) + self._h_right * math.sin(yaw)
+            h_dy = self._h_front * math.sin(yaw) - self._h_right * math.cos(yaw)
+            h_map_x = self.cur_x + h_dx
+            h_map_y = self.cur_y + h_dy
+            qz0, qw0 = self._yaw_toward(self.cur_x, self.cur_y, h_map_x, h_map_y)
+            p0.orientation.z = qz0
+            p0.orientation.w = qw0
+            qz1, qw1 = self._yaw_toward(tx, ty, h_map_x, h_map_y)
+            p1.orientation.z = qz1
+            p1.orientation.w = qw1
+            self.get_logger().debug(
+                f"[aim_at_h] H at map ({h_map_x:.2f},{h_map_y:.2f}); "
+                f"yaw toward H set on both poses."
+            )
+        elif self.aim_at_h and not h_fresh:
+            self.get_logger().debug(
+                "[aim_at_h] No fresh H detection (timeout); using identity orientation."
+            )
+            p0.orientation.w = 1.0
+            p1.orientation.w = 1.0
+        elif self.aim_at_home and self._have_home_from_odom:
             qz0, qw0 = self._yaw_toward(
                 self.cur_x, self.cur_y,
                 self._home_from_odom_x, self._home_from_odom_y,
@@ -417,7 +481,26 @@ class PadWaypointSupervisor(Node):
 
             nxt = self._pick_next_target()
             if nxt is None:
-                # Still discovering bases
+                # Check if all confirmed candidates are already visited/blocked —
+                # if so there is nothing left to find and we should go home rather
+                # than waiting indefinitely (fixes "stuck at last base" regression).
+                confirmed = [c for c in self.candidates if c.seen_count >= self.min_seen_count]
+                all_done = confirmed and all(
+                    c.visited or any(
+                        math.hypot(c.x - vx, c.y - vy) <= self.repeat_block_m
+                        for vx, vy in self.visited_positions
+                    )
+                    for c in confirmed
+                )
+                if all_done:
+                    self.get_logger().info(
+                        f"[DISCOVER] All {len(confirmed)} confirmed candidate(s) visited/blocked "
+                        f"but only {self.visited_count}/{self.bases_to_visit} counted. "
+                        "No more targets available — switching to RETURN_HOME."
+                    )
+                    self.state = "RETURN_HOME"
+                    self.active_target = (self.home_x, self.home_y)
+                # Still discovering bases (or waiting for more detections)
                 return
 
             self.active_target = nxt
