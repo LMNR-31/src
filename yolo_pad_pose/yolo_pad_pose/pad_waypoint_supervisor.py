@@ -19,6 +19,40 @@ def yaw_from_quat(x: float, y: float, z: float, w: float) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+def jump_filter_check(
+    last_right: Optional[float],
+    last_front: Optional[float],
+    right: float,
+    front: float,
+    max_jump_m: float,
+    consecutive_rejects: int,
+    jump_reject_reset_count: int,
+) -> str:
+    """Check whether a body-frame detection passes the jump filter.
+
+    Returns one of three string outcomes:
+
+    * ``'accept'``  – the detection is within *max_jump_m* of the current
+      anchor (or there is no anchor yet); the caller should update the anchor.
+    * ``'reject'``  – the jump is too large but the consecutive-rejection
+      counter has not reached *jump_reject_reset_count*; discard the detection.
+    * ``'reset'``   – the jump is too large **and** the counter has reached the
+      reset threshold; the caller should clear the anchor and accept this
+      detection as the new one.
+
+    Setting *jump_reject_reset_count* to ``0`` disables the auto-reset
+    (equivalent to the original behaviour).
+    """
+    if last_right is None:
+        return 'accept'
+    jump = math.hypot(right - last_right, front - last_front)
+    if jump <= max_jump_m:
+        return 'accept'
+    if jump_reject_reset_count > 0 and (consecutive_rejects + 1) >= jump_reject_reset_count:
+        return 'reset'
+    return 'reject'
+
+
 @dataclass
 class BaseCandidate:
     x: float
@@ -75,6 +109,9 @@ class PadWaypointSupervisor(Node):
         # Outlier rejection
         self.declare_parameter("max_detection_range_m", 6.0)  # reject if range > this
         self.declare_parameter("max_jump_m", 2.0)              # reject if body-frame jump > this
+        # Reset jump-filter anchor after this many consecutive rejections
+        # (0 = disabled, original behaviour)
+        self.declare_parameter("jump_reject_reset_count", 10)
 
         # Anti-repeat: skip candidates too close to already-visited positions
         self.declare_parameter("repeat_block_m", 1.2)
@@ -110,6 +147,8 @@ class PadWaypointSupervisor(Node):
         self.max_detection_range_m = float(
             self.get_parameter("max_detection_range_m").value)
         self.max_jump_m = float(self.get_parameter("max_jump_m").value)
+        self.jump_reject_reset_count = int(
+            self.get_parameter("jump_reject_reset_count").value)
         self.repeat_block_m = float(self.get_parameter("repeat_block_m").value)
         self.candidate_timeout_s = float(self.get_parameter("candidate_timeout_s").value)
 
@@ -141,6 +180,9 @@ class PadWaypointSupervisor(Node):
         # Last accepted detection in body frame (for jump filter)
         self._last_det_right: Optional[float] = None
         self._last_det_front: Optional[float] = None
+        # Consecutive jump-rejection counter and throttle timestamp
+        self._jump_reject_count: int = 0
+        self._last_jump_reject_warn_t: float = 0.0
 
         # Latest H-marker detection (body frame) and its timestamp
         self._last_h_right: Optional[float] = None
@@ -188,6 +230,7 @@ class PadWaypointSupervisor(Node):
             f"  reach_tol_m={self.reach_tol_m}  inter_base_wait_s={self.inter_base_wait_s}\n"
             f"  max_detection_range_m={self.max_detection_range_m}"
             f"  max_jump_m={self.max_jump_m}\n"
+            f"  jump_reject_reset_count={self.jump_reject_reset_count}\n"
             f"  repeat_block_m={self.repeat_block_m}"
             f"  candidate_timeout_s={self.candidate_timeout_s}\n"
             f"  enable_h_centering={self.enable_h_centering}"
@@ -247,15 +290,49 @@ class PadWaypointSupervisor(Node):
 
         if self._last_det_right is not None:
             jump = math.hypot(right - self._last_det_right, front - self._last_det_front)
-            if jump > self.max_jump_m:
+            outcome = jump_filter_check(
+                self._last_det_right, self._last_det_front,
+                right, front,
+                self.max_jump_m,
+                self._jump_reject_count,
+                self.jump_reject_reset_count,
+            )
+            if outcome == 'reset':
+                # Too many consecutive rejections: reset anchor and accept
+                # this detection as the new reference point.
                 self.get_logger().warn(
-                    f"[det] REJECTED jump={jump:.2f}m > max={self.max_jump_m}m "
-                    f"right={right:.2f} front={front:.2f}"
+                    f"[det] Jump filter re-anchored after "
+                    f"{self._jump_reject_count + 1} consecutive rejections; "
+                    f"accepting right={right:.2f} front={front:.2f}"
                 )
+                self._last_det_right = None
+                self._last_det_front = None
+                self._jump_reject_count = 0
+                # Fall through: anchor is now None, detection will be accepted.
+            elif outcome == 'reject':
+                self._jump_reject_count += 1
+                now_j = time.monotonic()
+                if now_j - self._last_jump_reject_warn_t >= 1.0:
+                    self._last_jump_reject_warn_t = now_j
+                    if self.jump_reject_reset_count > 0:
+                        reset_info = (
+                            f"(reject #{self._jump_reject_count}"
+                            f"/{self.jump_reject_reset_count})"
+                        )
+                    else:
+                        reset_info = (
+                            f"(reject #{self._jump_reject_count}, auto-reset disabled)"
+                        )
+                    self.get_logger().warn(
+                        f"[det] REJECTED jump={jump:.2f}m > max={self.max_jump_m}m "
+                        f"right={right:.2f} front={front:.2f} {reset_info}"
+                    )
                 return
+            # outcome == 'accept': fall through to update anchor
 
         self._last_det_right = right
         self._last_det_front = front
+        self._jump_reject_count = 0
 
         # Project to world frame (ENU) using odom yaw (no TF required).
         bx, by = self._body_to_world(front, right)

@@ -125,6 +125,7 @@ candidate list and ensure the node does not revisit already-visited bases.
 |-------------------------|-------|---------|-------------|
 | `max_detection_range_m` | float | `6.0`   | Reject incoming detections whose body-frame range `hypot(right, front)` exceeds this value. Recommended: set to the maximum reliable sensor range (typically **6 m**). |
 | `max_jump_m`            | float | `2.0`   | Reject a detection if its body-frame position jumps more than this distance from the last accepted detection. Filters sudden outlier spikes. |
+| `jump_reject_reset_count` | int | `10`   | After this many **consecutive** jump-rejections the filter resets its anchor and accepts the next detection as the new reference point. This prevents the node from getting permanently stuck rejecting a legitimately shifted detection stream (e.g. after the drone flies over a different pad). Set to `0` to disable the auto-reset (original behaviour). |
 | `repeat_block_m`        | float | `1.2`   | When choosing the next target, skip any candidate whose world-frame position is within this radius of any **already-visited** odom position. Prevents re-visiting the same physical base. |
 | `candidate_timeout_s`   | float | `120.0` | Drop **unvisited** candidates that have not been seen within this many seconds. Visited candidates are never dropped. Set to `0.0` to disable pruning. |
 
@@ -134,6 +135,7 @@ Recommended values for a 6-base indoor arena (bases spaced ≥ 1.5 m apart):
 ros2 run yolo_pad_pose pad_waypoint_supervisor --ros-args \
   -p max_detection_range_m:=6.0 \
   -p max_jump_m:=2.0 \
+  -p jump_reject_reset_count:=10 \
   -p repeat_block_m:=1.2 \
   -p candidate_timeout_s:=120.0
 ```
