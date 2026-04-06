@@ -66,6 +66,16 @@ class PadWaypointSupervisor(Node):
         self.declare_parameter("reach_tol_m", 0.15)       # XY distance to consider "reached"
         self.declare_parameter("inter_base_wait_s", 5.0)  # pause between consecutive bases (s)
 
+        # Outlier rejection
+        self.declare_parameter("max_detection_range_m", 6.0)  # reject if range > this
+        self.declare_parameter("max_jump_m", 2.0)              # reject if body-frame jump > this
+
+        # Anti-repeat: skip candidates too close to already-visited positions
+        self.declare_parameter("repeat_block_m", 1.2)
+
+        # Stale candidate pruning (unvisited only)
+        self.declare_parameter("candidate_timeout_s", 120.0)
+
         # ── Read parameters ───────────────────────────────────────────────────
         self.odom_topic = self.get_parameter("odom_topic").value
         self.base_det_topic = self.get_parameter("base_det_topic").value
@@ -83,6 +93,12 @@ class PadWaypointSupervisor(Node):
         self.reach_tol_m = float(self.get_parameter("reach_tol_m").value)
         self.inter_base_wait_s = float(self.get_parameter("inter_base_wait_s").value)
 
+        self.max_detection_range_m = float(
+            self.get_parameter("max_detection_range_m").value)
+        self.max_jump_m = float(self.get_parameter("max_jump_m").value)
+        self.repeat_block_m = float(self.get_parameter("repeat_block_m").value)
+        self.candidate_timeout_s = float(self.get_parameter("candidate_timeout_s").value)
+
         # ── Runtime state ─────────────────────────────────────────────────────
         self.have_odom: bool = False
         self.cur_x: float = 0.0
@@ -98,6 +114,11 @@ class PadWaypointSupervisor(Node):
         self.candidates: List[BaseCandidate] = []
         self.active_target: Optional[Tuple[float, float]] = None
         self.visited_count: int = 0
+        self.visited_positions: List[Tuple[float, float]] = []  # odom XY at each visit
+
+        # Last accepted detection in body frame (for jump filter)
+        self._last_det_right: Optional[float] = None
+        self._last_det_front: Optional[float] = None
 
         # FSM: COLLECT → NAVIGATE → WAIT_BETWEEN_BASES → RETURN_HOME → DONE
         self.state: str = "COLLECT"
@@ -132,7 +153,11 @@ class PadWaypointSupervisor(Node):
             f"  world_frame_id={self.world_frame_id}  z_fixed={self.z_fixed}\n"
             f"  bases_to_visit={self.bases_to_visit}\n"
             f"  cluster_tol_m={self.cluster_tol_m}  min_seen_count={self.min_seen_count}\n"
-            f"  reach_tol_m={self.reach_tol_m}  inter_base_wait_s={self.inter_base_wait_s}"
+            f"  reach_tol_m={self.reach_tol_m}  inter_base_wait_s={self.inter_base_wait_s}\n"
+            f"  max_detection_range_m={self.max_detection_range_m}"
+            f"  max_jump_m={self.max_jump_m}\n"
+            f"  repeat_block_m={self.repeat_block_m}"
+            f"  candidate_timeout_s={self.candidate_timeout_s}"
         )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
@@ -174,6 +199,27 @@ class PadWaypointSupervisor(Node):
         right = float(msg.point.x)
         front = float(msg.point.y)
 
+        # ── Outlier rejection ─────────────────────────────────────────────────
+        det_range = math.hypot(right, front)
+        if det_range > self.max_detection_range_m:
+            self.get_logger().warn(
+                f"[det] REJECTED range={det_range:.2f}m > max={self.max_detection_range_m}m "
+                f"right={right:.2f} front={front:.2f}"
+            )
+            return
+
+        if self._last_det_right is not None:
+            jump = math.hypot(right - self._last_det_right, front - self._last_det_front)
+            if jump > self.max_jump_m:
+                self.get_logger().warn(
+                    f"[det] REJECTED jump={jump:.2f}m > max={self.max_jump_m}m "
+                    f"right={right:.2f} front={front:.2f}"
+                )
+                return
+
+        self._last_det_right = right
+        self._last_det_front = front
+
         # Project to world frame (ENU) using odom yaw (no TF required).
         #   dx_world = cos(yaw)*front + sin(yaw)*right
         #   dy_world = sin(yaw)*front - cos(yaw)*right
@@ -198,6 +244,19 @@ class PadWaypointSupervisor(Node):
 
     def _update_candidates(self, bx: float, by: float):
         now = time.time()
+        # Prune stale unvisited candidates (never drop visited ones)
+        if self.candidate_timeout_s > 0.0:
+            before = len(self.candidates)
+            self.candidates = [
+                c for c in self.candidates
+                if c.visited or (now - c.last_seen_s) < self.candidate_timeout_s
+            ]
+            dropped = before - len(self.candidates)
+            if dropped:
+                self.get_logger().warn(
+                    f"[candidates] Pruned {dropped} stale unvisited candidate(s) "
+                    f"(timeout={self.candidate_timeout_s:.0f}s)"
+                )
         # Merge into the closest existing cluster within cluster_tol_m
         for c in self.candidates:
             if math.hypot(c.x - bx, c.y - by) <= self.cluster_tol_m:
@@ -220,6 +279,12 @@ class PadWaypointSupervisor(Node):
         for c in self.candidates:
             if c.visited or c.seen_count < self.min_seen_count:
                 continue
+            # Anti-repeat: skip if too close to any already-visited odom position
+            if any(
+                math.hypot(c.x - vx, c.y - vy) < self.repeat_block_m
+                for vx, vy in self.visited_positions
+            ):
+                continue
             d = math.hypot(c.x - self.cur_x, c.y - self.cur_y)
             if d < best_d:
                 best = c
@@ -236,6 +301,7 @@ class PadWaypointSupervisor(Node):
 
     def _mark_visited_at_odom(self):
         """Mark candidates near the current odom position as visited."""
+        self.visited_positions.append((self.cur_x, self.cur_y))
         for c in self.candidates:
             if math.hypot(c.x - self.cur_x, c.y - self.cur_y) <= self.cluster_tol_m:
                 c.visited = True

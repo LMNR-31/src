@@ -63,6 +63,28 @@ warning and forces progress (marks visited, continues to next base).
 | `use_mission_cycle_done`   | bool  | `true`  | If `false`, skip the `/mission_cycle_done` handshake entirely (standalone mode). |
 | `mission_cycle_timeout_s`  | float | `0.0`   | Seconds to wait for `/mission_cycle_done` before forcing progress. `0.0` disables the timeout. Only used when `use_mission_cycle_done=true`. |
 
+### Outlier rejection and robustness parameters
+
+These parameters prevent phantom / noisy detections from polluting the
+candidate list and ensure the node does not revisit already-visited bases.
+
+| Parameter               | Type  | Default | Description |
+|-------------------------|-------|---------|-------------|
+| `max_detection_range_m` | float | `6.0`   | Reject incoming detections whose body-frame range `hypot(right, front)` exceeds this value. Recommended: set to the maximum reliable sensor range (typically **6 m**). |
+| `max_jump_m`            | float | `2.0`   | Reject a detection if its body-frame position jumps more than this distance from the last accepted detection. Filters sudden outlier spikes. |
+| `repeat_block_m`        | float | `1.2`   | When choosing the next target, skip any candidate whose world-frame position is within this radius of any **already-visited** odom position. Prevents re-visiting the same physical base. |
+| `candidate_timeout_s`   | float | `120.0` | Drop **unvisited** candidates that have not been seen within this many seconds. Visited candidates are never dropped. Set to `0.0` to disable pruning. |
+
+Recommended values for a 6-base indoor arena (bases spaced ≥ 1.5 m apart):
+
+```bash
+ros2 run yolo_pad_pose pad_waypoint_supervisor --ros-args \
+  -p max_detection_range_m:=6.0 \
+  -p max_jump_m:=2.0 \
+  -p repeat_block_m:=1.2 \
+  -p candidate_timeout_s:=120.0
+```
+
 ### Parameters (axis / yaw correction)
 
 All flags default to **False** — the math is correct for the standard
