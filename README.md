@@ -140,6 +140,12 @@ ros2 run drone_control pouso --ros-args \
   -p y:=-2.0
 ```
 
+**Land on the YOLO-detected H marker closest to being directly under the drone:**
+```bash
+ros2 run drone_control pouso --ros-args \
+  -p use_yolo_h:=true
+```
+
 **Full parameter set:**
 ```bash
 ros2 run drone_control pouso --ros-args \
@@ -164,14 +170,20 @@ ros2 run drone_control pouso --ros-args \
 | `frame_id` | `map` | Coordinate frame for the published `PoseArray` |
 | `check_after_sec` | `15.0` | Timeout (s) before the node shuts down if landing is not confirmed |
 | `rate_hz` | `10.0` | Timer rate (Hz) |
+| `use_yolo_h` | `false` | Use the YOLO-detected H marker as landing target |
+| `h_topic` | `/landing_pad/h_relative_position` | Topic for YOLO H detections (`geometry_msgs/PointStamped`, `point.x=right`, `point.y=front`) |
+| `h_timeout_s` | `0.75` | Max age (s) of a valid H detection; older detections are ignored and the node falls back |
+| `max_h_range_m` | `6.0` | Reject H detections with planar range > this value (m) |
+| `prefer_closest_h` | `true` | Among recent detections pick the one with minimum range; `false` picks the latest |
 
 ### Topics
 
 | Topic | Direction | Type | Description |
 |-------|-----------|------|-------------|
 | `/waypoints` | Published | `geometry_msgs/PoseArray` | Landing waypoints consumed by `my_drone_controller` |
-| `/{uav}/mavros/local_position/odom` | Subscribed | `nav_msgs/Odometry` | Current drone position |
+| `/{uav}/mavros/local_position/odom` | Subscribed | `nav_msgs/Odometry` | Current drone position and yaw |
 | `/{uav}/mavros/state` | Subscribed | `mavros_msgs/State` | FCU connection status |
+| `/landing_pad/h_relative_position` | Subscribed | `geometry_msgs/PointStamped` | YOLO H detections (only when `use_yolo_h=true`) |
 
 ---
 
@@ -209,6 +221,48 @@ ros2 run drone_control missao_P_T
   individually using their `--ros-args` options; use `missao_P_T` for the
   automated default-parameter sequence.
 - The node exits automatically after the sequence completes.
+
+---
+
+## `supervisor_T` — Autonomous Mission Supervisor
+
+The `supervisor_T` node orchestrates the full autonomous cycle: takeoff → 360° yaw
+scan → wait for external trajectory → land (or run `missao_P_T`) → repeat.
+
+### State machine
+
+| State | Action |
+|-------|--------|
+| `INIT` | Forks `takeoff` automatically on startup |
+| `TAKING_OFF` | Waits for `takeoff` to exit, then starts `drone_yaw_360` |
+| `RUN_YAW` | Waits for the 360° scan to finish, publishes `/yaw_scan_done=true`, then enters `WAIT_TRAJ` |
+| `WAIT_TRAJ` | Monitors `/trajectory_progress` and `/trajectory_finished`; when a trajectory completes, decides which landing action to take |
+| `RUN_MISSION` | Runs `pouso` (at origin) or `missao_P_T` (elsewhere); when done publishes `/mission_cycle_done=true` and loops back to `WAIT_TRAJ` |
+
+### Landing decision at trajectory completion
+
+| Condition | Action |
+|-----------|--------|
+| `use_origin_as_base=true` (default) **and** drone within 0.1 m of (0, 0) | Run `pouso --ros-args -p use_current_xy:=true` — land at the drone's current local position |
+| Otherwise | Run `missao_P_T` — land-and-relaunch sequence |
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `uav_name` | `uav1` | UAV namespace prefix |
+| `use_origin_as_base` | `true` | When `true`, launch `pouso` with `use_current_xy:=true` if the drone returns to within 0.1 m of the origin; otherwise always run `missao_P_T` |
+
+### Quick start
+
+```bash
+ros2 run drone_control supervisor_T
+```
+
+**Force `missao_P_T` on every cycle (disable origin-based pouso):**
+```bash
+ros2 run drone_control supervisor_T --ros-args -p use_origin_as_base:=false
+```
 
 ---
 
