@@ -258,11 +258,7 @@ class PadWaypointSupervisor(Node):
         self._last_det_front = front
 
         # Project to world frame (ENU) using odom yaw (no TF required).
-        #   dx_world = cos(yaw)*front + sin(yaw)*right
-        #   dy_world = sin(yaw)*front - cos(yaw)*right
-        yaw = self.cur_yaw
-        bx = self.cur_x + front * math.cos(yaw) + right * math.sin(yaw)
-        by = self.cur_y + front * math.sin(yaw) - right * math.cos(yaw)
+        bx, by = self._body_to_world(front, right)
 
         self._update_candidates(bx, by)
 
@@ -271,7 +267,7 @@ class PadWaypointSupervisor(Node):
             self._last_det_info_t = now
             max_seen = max((c.seen_count for c in self.candidates), default=0)
             self.get_logger().info(
-                f"[det] right={right:.2f} front={front:.2f} yaw={yaw:.3f}rad "
+                f"[det] right={right:.2f} front={front:.2f} yaw={self.cur_yaw:.3f}rad "
                 f"bx={bx:.2f} by={by:.2f} "
                 f"candidates={len(self.candidates)} max_seen={max_seen} "
                 f"state={self.state} state_voo={self.state_voo}"
@@ -294,6 +290,19 @@ class PadWaypointSupervisor(Node):
         return (time.monotonic() - self._last_h_t) <= self.h_timeout_s
 
     # ── Candidate management ───────────────────────────────────────────────────
+
+    def _body_to_world(self, front: float, right: float) -> Tuple[float, float]:
+        """Project a body-frame detection to world-frame (ENU) using odom yaw.
+
+        Detection convention: right = +starboard, front = +nose.
+        Projection (no TF required):
+            dx_world = cos(yaw)*front + sin(yaw)*right
+            dy_world = sin(yaw)*front - cos(yaw)*right
+        """
+        yaw = self.cur_yaw
+        wx = self.cur_x + front * math.cos(yaw) + right * math.sin(yaw)
+        wy = self.cur_y + front * math.sin(yaw) - right * math.cos(yaw)
+        return wx, wy
 
     def _update_candidates(self, bx: float, by: float):
         now = time.time()
@@ -459,13 +468,7 @@ class PadWaypointSupervisor(Node):
                 if self._is_h_fresh():
                     h_range = math.hypot(self._last_h_right, self._last_h_front)
                     if h_range <= self.max_h_range_m:
-                        yaw = self.cur_yaw
-                        hx = (self.cur_x
-                              + self._last_h_front * math.cos(yaw)
-                              + self._last_h_right * math.sin(yaw))
-                        hy = (self.cur_y
-                              + self._last_h_front * math.sin(yaw)
-                              - self._last_h_right * math.cos(yaw))
+                        hx, hy = self._body_to_world(self._last_h_front, self._last_h_right)
                         cmd_x, cmd_y = hx, hy
                         centering_active = True
                         now_m = time.monotonic()
