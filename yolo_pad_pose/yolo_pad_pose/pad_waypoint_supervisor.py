@@ -352,11 +352,35 @@ class PadWaypointSupervisor(Node):
             )
         return (best.x, best.y)
 
-    def _mark_visited_at_odom(self):
-        """Mark candidates near the current odom position as visited."""
+    def _mark_visited_at_odom(
+        self, active_target: Optional[Tuple[float, float]] = None
+    ):
+        """Mark candidates near the current odom position as visited.
+
+        Uses repeat_block_m as the search radius (same value used in
+        _pick_next_target) so both anti-repeat layers are consistent.
+        When active_target is provided, candidates within cluster_tol_m of
+        that position are also flagged, covering the case where H-centering
+        placed the drone at the pad centre while the EMA candidate is offset.
+        The active_target position is appended to visited_positions so that
+        future new clusters near the same physical base are also blocked.
+        """
         self.visited_positions.append((self.cur_x, self.cur_y))
+        if active_target is not None:
+            ax, ay = active_target
+            # Record the base EMA position only if not already covered by odom
+            if math.hypot(ax - self.cur_x, ay - self.cur_y) > self.cluster_tol_m:
+                self.visited_positions.append((ax, ay))
         for c in self.candidates:
-            if math.hypot(c.x - self.cur_x, c.y - self.cur_y) <= self.cluster_tol_m:
+            if c.visited:
+                continue
+            # Mark if within repeat_block_m of current odom (drone's actual position)
+            if math.hypot(c.x - self.cur_x, c.y - self.cur_y) <= self.repeat_block_m:
+                c.visited = True
+            # Also mark if within cluster_tol_m of the active base EMA center
+            elif active_target is not None and math.hypot(
+                c.x - active_target[0], c.y - active_target[1]
+            ) <= self.cluster_tol_m:
                 c.visited = True
 
     # ── Waypoint publisher ─────────────────────────────────────────────────────
@@ -469,7 +493,7 @@ class PadWaypointSupervisor(Node):
             if centering_active:
                 d_center = math.hypot(hx - self.cur_x, hy - self.cur_y)
                 if d_center <= self.centering_reach_tol_m:
-                    self._mark_visited_at_odom()
+                    self._mark_visited_at_odom(self.active_target)
                     self.visited_count += 1
                     self.get_logger().info(
                         f"[STATE] Reached base #{self.visited_count} via H centering "
@@ -484,7 +508,7 @@ class PadWaypointSupervisor(Node):
                 d = math.hypot(cmd_x - self.cur_x, cmd_y - self.cur_y)
                 if d <= self.reach_tol_m:
                     # Mark base as visited using the actual odom position
-                    self._mark_visited_at_odom()
+                    self._mark_visited_at_odom(self.active_target)
                     self.visited_count += 1
                     self.get_logger().info(
                         f"[STATE] Reached base #{self.visited_count} within {self.reach_tol_m}m "
