@@ -1,18 +1,20 @@
 // supervisor_T.cpp — ROS 2 supervisor node.
 //
 // State machine:
-//   INIT        → Forks takeoff process on startup.
-//   TAKING_OFF  → Waits (via WNOHANG poll) for the takeoff process to exit.
-//                 On exit code 0 → transitions to RUN_YAW.
-//                 On any other exit → transitions directly to WAIT_TRAJ.
-//   RUN_YAW     → Forks drone_yaw_360 with yaw_target_delta:=6.2831853,
-//                 waits for it to exit, then transitions to WAIT_TRAJ.
-//   WAIT_TRAJ   → Monitors /trajectory_progress and /trajectory_finished;
-//                 transitions to RUN_MISSION when a trajectory completes.
-//   RUN_MISSION → Forks missao_P_T (or pouso with use_current_xy:=true when
-//                 use_origin_as_base=true and the UAV is at the origin), waits
-//                 for it to exit, then loops back to WAIT_TRAJ for the next
-//                 cycle (infinite loop).
+//   INIT                → Forks takeoff process on startup.
+//   TAKING_OFF          → Waits (via WNOHANG poll) for the takeoff process to exit.
+//                         On exit code 0 → transitions to RUN_YAW.
+//                         On any other exit → transitions directly to WAIT_TRAJ.
+//   RUN_YAW             → Forks drone_yaw_360 with yaw_target_delta:=6.2831853,
+//                         waits for it to exit, then transitions to WAIT_TRAJ.
+//   WAIT_TRAJ           → Monitors /trajectory_progress and /trajectory_finished;
+//                         transitions to WAIT_BEFORE_MISSION when a trajectory completes.
+//   WAIT_BEFORE_MISSION → Waits wait_after_traj_done_s seconds (default 5.0) before
+//                         launching the next mission; then transitions to RUN_MISSION.
+//   RUN_MISSION         → Forks missao_P_T (or pouso with use_current_xy:=true when
+//                         use_origin_as_base=true and the UAV is at the origin), waits
+//                         for it to exit, then loops back to WAIT_TRAJ for the next
+//                         cycle (infinite loop).
 //
 // Trajectory-detection logic (WAIT_TRAJ only):
 //   • /trajectory_progress < 99.9  → new trajectory in progress (reset guards)
@@ -33,11 +35,20 @@
 // waitpid(WNOHANG) inside the FSM timer to keep the executor unblocked.
 //
 // Parameters:
-//   uav_name            (string, default "uav1")  — UAV namespace prefix
-//   use_origin_as_base  (bool,   default true)    — when true (default), launch
-//                         pouso with use_current_xy:=true instead of missao_P_T
-//                         if the drone is within 0.1 m of (0,0) at trajectory
-//                         completion; when false, always launch missao_P_T.
+//   uav_name                (string, default "uav1")  — UAV namespace prefix
+//   use_origin_as_base      (bool,   default true)    — when true (default), launch
+//                             pouso with use_current_xy:=true instead of missao_P_T
+//                             if the drone is within 0.1 m of (0,0) at trajectory
+//                             completion; when false, always launch missao_P_T.
+//   wait_after_traj_done_s  (double, default 5.0)     — seconds to wait in
+//                             WAIT_BEFORE_MISSION before launching the next mission
+//                             after a trajectory is considered complete.
+//   min_relaunch_dist_m     (double, default 0.5)     — minimum XY distance (m) the
+//                             drone must have moved from the last mission launch
+//                             position before a new mission is allowed; if the drone
+//                             is closer than this, the mission is skipped and the
+//                             supervisor returns to WAIT_TRAJ (prevents landing twice
+//                             in a row at the same spot); set to 0.0 to disable.
 //
 // Usage:
 //   ros2 run drone_control supervisor_T
@@ -54,11 +65,12 @@
 
 // ── State machine states ───────────────────────────────────────────────────
 enum class SupervisorState {
-    INIT,         // Initial state: will fire takeoff immediately
-    TAKING_OFF,   // Takeoff process is running; waiting for it to exit
-    RUN_YAW,      // drone_yaw_360 is running; waiting for it to exit
-    WAIT_TRAJ,    // Waiting for a trajectory to start and then complete
-    RUN_MISSION,  // missao_P_T is running; waiting for it to exit
+    INIT,                  // Initial state: will fire takeoff immediately
+    TAKING_OFF,            // Takeoff process is running; waiting for it to exit
+    RUN_YAW,               // drone_yaw_360 is running; waiting for it to exit
+    WAIT_TRAJ,             // Waiting for a trajectory to start and then complete
+    WAIT_BEFORE_MISSION,   // Trajectory done; waiting wait_after_traj_done_s before launching
+    RUN_MISSION,           // missao_P_T is running; waiting for it to exit
 };
 
 // Number of FSM ticks (× 500 ms each = 1 s total) to ignore trajectory
@@ -81,6 +93,12 @@ public:
       current_x_(0.0),
       current_y_(0.0),
       use_origin_as_base_(false),
+      wait_after_traj_done_s_(5.0),
+      wait_start_time_(0, 0, RCL_ROS_TIME),  // sentinel; overwritten in check_trajectory()
+      min_relaunch_dist_m_(0.5),
+      last_mission_valid_(false),
+      last_mission_x_(0.0),
+      last_mission_y_(0.0),
       current_child_exec_("missao_P_T")
     {
         this->declare_parameter<std::string>("uav_name", "uav1");
@@ -88,6 +106,12 @@ public:
 
         this->declare_parameter<bool>("use_origin_as_base", true);
         use_origin_as_base_ = this->get_parameter("use_origin_as_base").as_bool();
+
+        this->declare_parameter<double>("wait_after_traj_done_s", 5.0);
+        wait_after_traj_done_s_ = this->get_parameter("wait_after_traj_done_s").as_double();
+
+        this->declare_parameter<double>("min_relaunch_dist_m", 0.5);
+        min_relaunch_dist_m_ = this->get_parameter("min_relaunch_dist_m").as_double();
 
         progress_sub_ = this->create_subscription<std_msgs::msg::Float32>(
             "/trajectory_progress", 10,
@@ -115,8 +139,11 @@ public:
         RCLCPP_INFO(this->get_logger(),
             "supervisor_T iniciado — executando takeoff automático e iniciando "
             "missao_P_T em ciclos infinitos após cada trajetória. "
-            "use_origin_as_base=%s",
-            use_origin_as_base_ ? "true" : "false");
+            "use_origin_as_base=%s, wait_after_traj_done_s=%.1f, "
+            "min_relaunch_dist_m=%.2f",
+            use_origin_as_base_ ? "true" : "false",
+            wait_after_traj_done_s_,
+            min_relaunch_dist_m_);
     }
 
 private:
@@ -191,6 +218,9 @@ private:
                 break;
             case SupervisorState::WAIT_TRAJ:
                 check_trajectory();
+                break;
+            case SupervisorState::WAIT_BEFORE_MISSION:
+                check_wait_before_mission();
                 break;
             case SupervisorState::RUN_MISSION:
                 check_mission();
@@ -323,7 +353,53 @@ private:
             return;
         }
 
-        // Determine which executable to launch next.
+        // Trajectory is complete.  Log and enter the pre-mission wait state
+        // instead of launching immediately.
+        RCLCPP_INFO(this->get_logger(),
+            "[WAIT_TRAJ] 🏁 Trajetória concluída. "
+            "Aguardando %.1f s antes de iniciar nova missão…",
+            wait_after_traj_done_s_);
+
+        reset_trajectory_guards();
+        wait_start_time_ = this->now();
+        state_ = SupervisorState::WAIT_BEFORE_MISSION;
+    }
+
+    // ── WAIT_BEFORE_MISSION: hold wait_after_traj_done_s_ seconds, then launch ──
+    void check_wait_before_mission() {
+        const double elapsed = (this->now() - wait_start_time_).seconds();
+        if (elapsed < wait_after_traj_done_s_) {
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "[WAIT_BEFORE_MISSION] Aguardando %.1f s antes de iniciar nova missão "
+                "(%.1f s / %.1f s)…",
+                wait_after_traj_done_s_, elapsed, wait_after_traj_done_s_);
+            return;
+        }
+
+        // Guard: do not allow a new mission if the drone hasn't moved far enough
+        // from the last mission launch position (prevents landing twice in a row
+        // at the same spot).
+        if (min_relaunch_dist_m_ > 0.0 && last_mission_valid_ && odom_received_) {
+            const double d = std::hypot(current_x_ - last_mission_x_,
+                                        current_y_ - last_mission_y_);
+            if (d < min_relaunch_dist_m_) {
+                RCLCPP_WARN(this->get_logger(),
+                    "[WAIT_BEFORE_MISSION] ⛔ Posição atual (%.2f, %.2f) está a "
+                    "%.2fm da última missão (%.2f, %.2f) — "
+                    "mínimo: %.2fm. Missão ignorada para evitar pouso repetido. "
+                    "Retornando a WAIT_TRAJ…",
+                    current_x_, current_y_, d,
+                    last_mission_x_, last_mission_y_,
+                    min_relaunch_dist_m_);
+                // trajectory guards were already cleared on entry to this state;
+                // only set the cooldown and return to WAIT_TRAJ.
+                post_reset_ticks_ = POST_RESET_COOLDOWN_TICKS;
+                state_ = SupervisorState::WAIT_TRAJ;
+                return;
+            }
+        }
+
+        // Delay elapsed — determine which executable to launch next.
         // When use_origin_as_base_=true (default) and the drone is within BASE_TOL
         // of the origin, launch pouso with use_current_xy:=true (local position).
         // Otherwise (use_origin_as_base_=false, or drone not at origin), run missao_P_T.
@@ -339,31 +415,40 @@ private:
 
         if (at_base) {
             RCLCPP_INFO(this->get_logger(),
-                "[WAIT_TRAJ] 🏁 Trajetória concluída e UAV no ponto base "
+                "[WAIT_BEFORE_MISSION] ⏱️  %.1f s concluídos. UAV no ponto base "
                 "(x=%.2f y=%.2f) — lançando pouso com posição local…",
-                current_x_, current_y_);
+                wait_after_traj_done_s_, current_x_, current_y_);
         } else if (!odom_received_) {
             RCLCPP_WARN(this->get_logger(),
-                "[WAIT_TRAJ] 🏁 Trajetória concluída, mas ainda sem odometria. "
-                "Lançando missao_P_T…");
+                "[WAIT_BEFORE_MISSION] ⏱️  %.1f s concluídos (sem odometria) — "
+                "lançando missao_P_T…",
+                wait_after_traj_done_s_);
         } else {
             RCLCPP_INFO(this->get_logger(),
-                "[WAIT_TRAJ] 🏁 Trajetória concluída (x=%.2f y=%.2f) — lançando missao_P_T…",
-                current_x_, current_y_);
+                "[WAIT_BEFORE_MISSION] ⏱️  %.1f s concluídos (x=%.2f y=%.2f) — "
+                "lançando missao_P_T…",
+                wait_after_traj_done_s_, current_x_, current_y_);
         }
 
         child_pid_ = at_base ? fork_exec_pouso_local() : fork_exec("missao_P_T");
         if (child_pid_ > 0) {
-            reset_trajectory_guards();
+            // Record this launch position so the next cycle can enforce the
+            // same-spot guard.
+            if (odom_received_) {
+                last_mission_x_     = current_x_;
+                last_mission_y_     = current_y_;
+                last_mission_valid_ = true;
+            }
             state_ = SupervisorState::RUN_MISSION;
             RCLCPP_INFO(this->get_logger(),
                 "[RUN_MISSION] %s iniciado (PID %d).",
                 next_exec, static_cast<int>(child_pid_));
         } else {
             RCLCPP_ERROR(this->get_logger(),
-                "[WAIT_TRAJ] fork() falhou ao iniciar %s! Tentando novamente em 500 ms…",
+                "[WAIT_BEFORE_MISSION] fork() falhou ao iniciar %s! "
+                "Tentando novamente em 500 ms…",
                 next_exec);
-            // Keep trajectory_done_ set so the next tick retries.
+            // Keep state as WAIT_BEFORE_MISSION so the next tick retries.
         }
     }
 
@@ -473,6 +558,12 @@ private:
 
     // Mission launch policy
     bool        use_origin_as_base_;      // param: gate pouso on proximity to origin
+    double      wait_after_traj_done_s_;  // param: seconds to wait before launching next mission
+    rclcpp::Time wait_start_time_;        // time when WAIT_BEFORE_MISSION began
+    double      min_relaunch_dist_m_;     // param: min distance from last launch to allow new mission
+    bool        last_mission_valid_;      // true once a mission has been launched with valid odom
+    double      last_mission_x_;          // odom X at the last mission launch
+    double      last_mission_y_;          // odom Y at the last mission launch
     std::string current_child_exec_;      // name of the executable currently running in RUN_MISSION
 };
 
