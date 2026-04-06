@@ -176,7 +176,7 @@ class PadWaypointSupervisor(Node):
         # Lost-recovery state
         self._last_valid_candidate_t: float = time.time()
         self._yaw_scan_active: bool = False
-        self._yaw_scan_proc: Optional[subprocess.Popen] = None  # type: ignore[type-arg]
+        self._yaw_scan_proc: Optional[subprocess.Popen[bytes]] = None
         self._last_yaw_scan_t: float = 0.0
 
         # ROS I/O
@@ -445,24 +445,9 @@ class PadWaypointSupervisor(Node):
 
     def _try_yaw_scan_recovery(self):
         """Trigger a non-blocking yaw-360 recovery scan if not already scanning."""
-        now = time.time()
-        # Poll existing subprocess first
-        if self._yaw_scan_active and self._yaw_scan_proc is not None:
-            ret = self._yaw_scan_proc.poll()
-            if ret is not None:
-                self._yaw_scan_active = False
-                self._yaw_scan_proc = None
-                if ret == 0:
-                    self.get_logger().info("[LOST] drone_yaw_360 completed successfully.")
-                else:
-                    self.get_logger().warning(
-                        f"[LOST] drone_yaw_360 exited with code {ret}."
-                    )
-            else:
-                # Still running
-                return
         if self._yaw_scan_active:
             return
+        now = time.time()
         if now - self._last_yaw_scan_t < self.yaw_scan_cooldown_s:
             return
         self.get_logger().warning(
@@ -472,8 +457,8 @@ class PadWaypointSupervisor(Node):
         try:
             proc = subprocess.Popen(
                 ["ros2", "run", "drone_control", "drone_yaw_360"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
             self._yaw_scan_active = True
             self._yaw_scan_proc = proc
