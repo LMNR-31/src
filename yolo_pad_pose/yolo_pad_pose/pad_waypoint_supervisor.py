@@ -215,8 +215,6 @@ class PadWaypointSupervisor(Node):
                     f"[det] REJECTED jump={jump:.2f}m > max={self.max_jump_m}m "
                     f"right={right:.2f} front={front:.2f}"
                 )
-                self._last_det_right = right
-                self._last_det_front = front
                 return
 
         self._last_det_right = right
