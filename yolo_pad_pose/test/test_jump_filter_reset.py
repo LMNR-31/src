@@ -1,45 +1,7 @@
 """Unit tests for the jump_filter_check helper in pad_waypoint_supervisor."""
 import math
-import sys
-import types
-import os
 
-# ---------------------------------------------------------------------------
-# Stub out ROS 2 modules so the supervisor can be imported without a ROS
-# environment.  Only the minimum surface needed by the module-level code is
-# mocked here; the actual Node class is never instantiated in these tests.
-# ---------------------------------------------------------------------------
-for _mod in [
-    'rclpy', 'rclpy.node', 'rclpy.qos',
-    'geometry_msgs', 'geometry_msgs.msg',
-    'nav_msgs', 'nav_msgs.msg',
-    'std_msgs', 'std_msgs.msg',
-]:
-    if _mod not in sys.modules:
-        sys.modules[_mod] = types.ModuleType(_mod)
-
-# rclpy.node.Node stub
-sys.modules['rclpy.node'].Node = object
-
-# rclpy.qos stubs
-_qos = sys.modules['rclpy.qos']
-_qos.QoSProfile = object
-_qos.DurabilityPolicy = types.SimpleNamespace(TRANSIENT_LOCAL=None)
-_qos.ReliabilityPolicy = types.SimpleNamespace(RELIABLE=None)
-
-# message stubs
-for _msg_attr, _msg_mod in [
-    ('Pose', 'geometry_msgs.msg'),
-    ('PoseArray', 'geometry_msgs.msg'),
-    ('PointStamped', 'geometry_msgs.msg'),
-    ('Odometry', 'nav_msgs.msg'),
-    ('Int32', 'std_msgs.msg'),
-]:
-    setattr(sys.modules[_msg_mod], _msg_attr, object)
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-from yolo_pad_pose.pad_waypoint_supervisor import jump_filter_check  # noqa: E402
+from yolo_pad_pose.pad_waypoint_supervisor import jump_filter_check
 
 
 class TestJumpFilterCheck:

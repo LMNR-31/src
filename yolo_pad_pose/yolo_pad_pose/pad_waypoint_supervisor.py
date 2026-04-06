@@ -228,8 +228,8 @@ class PadWaypointSupervisor(Node):
             f"  bases_to_visit={self.bases_to_visit}\n"
             f"  cluster_tol_m={self.cluster_tol_m}  min_seen_count={self.min_seen_count}\n"
             f"  reach_tol_m={self.reach_tol_m}  inter_base_wait_s={self.inter_base_wait_s}\n"
-            f"  max_detection_range_m={self.max_detection_range_m}\n"
-            f"  max_jump_m={self.max_jump_m}"
+            f"  max_detection_range_m={self.max_detection_range_m}"
+            f"  max_jump_m={self.max_jump_m}\n"
             f"  jump_reject_reset_count={self.jump_reject_reset_count}\n"
             f"  repeat_block_m={self.repeat_block_m}"
             f"  candidate_timeout_s={self.candidate_timeout_s}\n"
@@ -290,45 +290,45 @@ class PadWaypointSupervisor(Node):
 
         if self._last_det_right is not None:
             jump = math.hypot(right - self._last_det_right, front - self._last_det_front)
-            if jump > self.max_jump_m:
-                outcome = jump_filter_check(
-                    self._last_det_right, self._last_det_front,
-                    right, front,
-                    self.max_jump_m,
-                    self._jump_reject_count,
-                    self.jump_reject_reset_count,
+            outcome = jump_filter_check(
+                self._last_det_right, self._last_det_front,
+                right, front,
+                self.max_jump_m,
+                self._jump_reject_count,
+                self.jump_reject_reset_count,
+            )
+            if outcome == 'reset':
+                # Too many consecutive rejections: reset anchor and accept
+                # this detection as the new reference point.
+                self.get_logger().warn(
+                    f"[det] Jump filter re-anchored after "
+                    f"{self._jump_reject_count + 1} consecutive rejections; "
+                    f"accepting right={right:.2f} front={front:.2f}"
                 )
-                if outcome == 'reset':
-                    # Too many consecutive rejections: reset anchor and accept
-                    # this detection as the new reference point.
-                    self.get_logger().warn(
-                        f"[det] Jump filter re-anchored after "
-                        f"{self._jump_reject_count + 1} consecutive rejections; "
-                        f"accepting right={right:.2f} front={front:.2f}"
-                    )
-                    self._last_det_right = None
-                    self._last_det_front = None
-                    self._jump_reject_count = 0
-                    # Fall through: anchor is now None, detection will be accepted.
-                else:
-                    self._jump_reject_count += 1
-                    now_j = time.monotonic()
-                    if now_j - self._last_jump_reject_warn_t >= 1.0:
-                        self._last_jump_reject_warn_t = now_j
-                        if self.jump_reject_reset_count > 0:
-                            reset_info = (
-                                f"(reject #{self._jump_reject_count}"
-                                f"/{self.jump_reject_reset_count})"
-                            )
-                        else:
-                            reset_info = (
-                                f"(reject #{self._jump_reject_count}, auto-reset disabled)"
-                            )
-                        self.get_logger().warn(
-                            f"[det] REJECTED jump={jump:.2f}m > max={self.max_jump_m}m "
-                            f"right={right:.2f} front={front:.2f} {reset_info}"
+                self._last_det_right = None
+                self._last_det_front = None
+                self._jump_reject_count = 0
+                # Fall through: anchor is now None, detection will be accepted.
+            elif outcome == 'reject':
+                self._jump_reject_count += 1
+                now_j = time.monotonic()
+                if now_j - self._last_jump_reject_warn_t >= 1.0:
+                    self._last_jump_reject_warn_t = now_j
+                    if self.jump_reject_reset_count > 0:
+                        reset_info = (
+                            f"(reject #{self._jump_reject_count}"
+                            f"/{self.jump_reject_reset_count})"
                         )
-                    return
+                    else:
+                        reset_info = (
+                            f"(reject #{self._jump_reject_count}, auto-reset disabled)"
+                        )
+                    self.get_logger().warn(
+                        f"[det] REJECTED jump={jump:.2f}m > max={self.max_jump_m}m "
+                        f"right={right:.2f} front={front:.2f} {reset_info}"
+                    )
+                return
+            # outcome == 'accept': fall through to update anchor
 
         self._last_det_right = right
         self._last_det_front = front
