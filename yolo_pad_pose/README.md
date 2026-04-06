@@ -18,12 +18,15 @@ Detection messages (`/landing_pad/base_relative_position`,
 | `point.y`   | **front** (+forward, nose direction)        |
 | `point.z`   | fixed altitude (ignored here)               |
 
-This is **not** the ROS base_link convention (where `x = forward`, `y = left`),
+This is **not** the ROS base_link convention (REP-103: `x = forward`, `y = left`),
 but the projection formula inside `cb_det` accounts for it:
 
 ```
-dx_world = cos(yaw)*front + sin(yaw)*right   # ≡ cos(yaw)*x_bl - sin(yaw)*y_bl
-dy_world = sin(yaw)*front - cos(yaw)*right   # ≡ sin(yaw)*x_bl + cos(yaw)*y_bl
+# Map detection frame → ROS base_link:
+#   x_bl = front_det,  y_bl = left = -right_det
+# ENU rotation by yaw (CCW positive):
+dx_world = cos(yaw)*front + sin(yaw)*right   # = cos(yaw)*x_bl - sin(yaw)*y_bl
+dy_world = sin(yaw)*front - cos(yaw)*right   # = sin(yaw)*x_bl + cos(yaw)*y_bl
 ```
 
 where `yaw` is the heading read from `/uav1/mavros/local_position/odom`

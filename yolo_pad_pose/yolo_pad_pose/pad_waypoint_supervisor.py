@@ -351,9 +351,10 @@ class PadWaypointSupervisor(Node):
         #  - x = right  (drone body frame, +right = drone's starboard side)
         #  - y = front  (drone body frame, +forward = nose direction)
         #  - z = fixed altitude (unused here)
-        # This matches ROS base_link where x_bl = front and y_bl = left = -right, so the
-        # rotation to ENU world is: dx = cos(yaw)*front + sin(yaw)*right,
-        #                           dy = sin(yaw)*front - cos(yaw)*right.
+        # Mapping to ROS base_link (x_bl = forward, y_bl = left):
+        #   x_bl = front_detection,  y_bl = left = -right_detection
+        # so the ENU rotation is: dx = cos(yaw)*front + sin(yaw)*right,
+        #                         dy = sin(yaw)*front - cos(yaw)*right.
 
         stamp = msg.header.stamp
         if stamp.sec == 0 and stamp.nanosec == 0:
@@ -432,13 +433,14 @@ class PadWaypointSupervisor(Node):
         # Project to world frame (2D) using odom yaw — no TF required.
         #
         # Detection (body frame, this node's convention):
-        #   right = +drone-right,  front = +drone-forward
-        # ROS base_link:  x_bl = front,  y_bl = -right  (left positive)
+        #   right_det = +drone-right,  front_det = +drone-forward
+        # ROS base_link (REP-103): x_bl = forward, y_bl = left (left-positive)
+        #   x_bl = front_det,  y_bl = left = -right_det
         # ENU rotation by yaw (CCW positive from +X toward +Y):
         #   dx_world = cos(yaw)*x_bl - sin(yaw)*y_bl
-        #            = cos(yaw)*front + sin(yaw)*right
+        #            = cos(yaw)*front_det + sin(yaw)*right_det
         #   dy_world = sin(yaw)*x_bl + cos(yaw)*y_bl
-        #            = sin(yaw)*front - cos(yaw)*right
+        #            = sin(yaw)*front_det - cos(yaw)*right_det
         yaw = -self.cur_yaw if self.invert_yaw else self.cur_yaw
         dx_map = front * math.cos(yaw) + right * math.sin(yaw)
         dy_map = front * math.sin(yaw) - right * math.cos(yaw)
