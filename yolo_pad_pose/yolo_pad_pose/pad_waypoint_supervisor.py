@@ -400,7 +400,10 @@ class PadWaypointSupervisor(Node):
         h_fresh = (time.monotonic() - self._h_last_t) <= self.h_timeout_s
         if self.aim_at_h and h_fresh:
             # Project H relative position (right, front in base_link) to map frame
-            # using the current drone yaw — same projection used for base candidates.
+            # using the current drone yaw.  The body→map rotation is:
+            #   map_dx = front * cos(yaw) + right * sin(yaw)
+            #   map_dy = front * sin(yaw) - right * cos(yaw)
+            # (same formula used for projecting base detections to map).
             yaw = self.cur_yaw
             h_dx = self._h_front * math.cos(yaw) + self._h_right * math.sin(yaw)
             h_dy = self._h_front * math.sin(yaw) - self._h_right * math.cos(yaw)
@@ -485,7 +488,7 @@ class PadWaypointSupervisor(Node):
                 # if so there is nothing left to find and we should go home rather
                 # than waiting indefinitely (fixes "stuck at last base" regression).
                 confirmed = [c for c in self.candidates if c.seen_count >= self.min_seen_count]
-                all_done = confirmed and all(
+                all_done = bool(confirmed) and all(
                     c.visited or any(
                         math.hypot(c.x - vx, c.y - vy) <= self.repeat_block_m
                         for vx, vy in self.visited_positions

@@ -36,9 +36,8 @@ class YoloPadPose(Node):
         self.declare_parameter("conf", 0.25)
         # base_class_id / h_class_id map YOLO class indices to semantic roles.
         # Defaults match the dataset convention: base=0, h=1, borda=2.
-        # class_pad is kept for backward compatibility and is treated as an
-        # alias for base_class_id when base_class_id is at its default (-1
-        # means "use class_pad value").
+        # class_pad is kept for backward compatibility: when class_pad != 0 and
+        # base_class_id is at its default (0), class_pad is used as base_class_id.
         self.declare_parameter("class_pad", 0)       # deprecated alias
         self.declare_parameter("base_class_id", 0)   # YOLO class id for base
         self.declare_parameter("h_class_id", 1)      # YOLO class id for H marker
@@ -58,8 +57,11 @@ class YoloPadPose(Node):
         self.conf = float(self.get_parameter("conf").value)
         self.base_class_id = int(self.get_parameter("base_class_id").value)
         self.h_class_id = int(self.get_parameter("h_class_id").value)
-        # Honour legacy class_pad parameter if someone passes it explicitly
-        # and base_class_id was left at the default value of 0.
+        # Honour legacy class_pad parameter: if it was set to a non-zero value
+        # and base_class_id was not explicitly overridden from its default (0),
+        # treat class_pad as the base class id and emit a deprecation warning.
+        # Note: if both class_pad and base_class_id are changed from their
+        # defaults, base_class_id takes precedence.
         _class_pad = int(self.get_parameter("class_pad").value)
         if _class_pad != 0 and self.base_class_id == 0:
             self.base_class_id = _class_pad
