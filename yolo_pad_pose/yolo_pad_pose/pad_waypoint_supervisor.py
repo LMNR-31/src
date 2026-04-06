@@ -109,7 +109,8 @@ class PadWaypointSupervisor(Node):
         # Outlier rejection
         self.declare_parameter("max_detection_range_m", 6.0)  # reject if range > this
         self.declare_parameter("max_jump_m", 2.0)              # reject if body-frame jump > this
-        # Reset jump-filter anchor after this many consecutive rejections (0 = disabled)
+        # Reset jump-filter anchor after this many consecutive rejections
+        # (0 = disabled, original behaviour)
         self.declare_parameter("jump_reject_reset_count", 10)
 
         # Anti-repeat: skip candidates too close to already-visited positions
@@ -227,7 +228,7 @@ class PadWaypointSupervisor(Node):
             f"  bases_to_visit={self.bases_to_visit}\n"
             f"  cluster_tol_m={self.cluster_tol_m}  min_seen_count={self.min_seen_count}\n"
             f"  reach_tol_m={self.reach_tol_m}  inter_base_wait_s={self.inter_base_wait_s}\n"
-            f"  max_detection_range_m={self.max_detection_range_m}"
+            f"  max_detection_range_m={self.max_detection_range_m}\n"
             f"  max_jump_m={self.max_jump_m}"
             f"  jump_reject_reset_count={self.jump_reject_reset_count}\n"
             f"  repeat_block_m={self.repeat_block_m}"
@@ -314,11 +315,18 @@ class PadWaypointSupervisor(Node):
                     now_j = time.monotonic()
                     if now_j - self._last_jump_reject_warn_t >= 1.0:
                         self._last_jump_reject_warn_t = now_j
+                        if self.jump_reject_reset_count > 0:
+                            reset_info = (
+                                f"(reject #{self._jump_reject_count}"
+                                f"/{self.jump_reject_reset_count})"
+                            )
+                        else:
+                            reset_info = (
+                                f"(reject #{self._jump_reject_count}, auto-reset disabled)"
+                            )
                         self.get_logger().warn(
                             f"[det] REJECTED jump={jump:.2f}m > max={self.max_jump_m}m "
-                            f"right={right:.2f} front={front:.2f} "
-                            f"(reject #{self._jump_reject_count}"
-                            f"/{self.jump_reject_reset_count})"
+                            f"right={right:.2f} front={front:.2f} {reset_info}"
                         )
                     return
 
