@@ -51,7 +51,7 @@ class PadWaypointSupervisor(Node):
         self.declare_parameter("use_trajectory_finished", True)
         self.declare_parameter("mission_cycle_done_topic", "/mission_cycle_done")
         self.declare_parameter("use_mission_cycle_done", True)
-        self.declare_parameter("mission_cycle_timeout_s", 0.0)  # 0 = disabled; >0 forces progress after this many seconds
+        self.declare_parameter("mission_cycle_timeout_s", 0.0)  # <=0 = disabled; >0 forces progress after this many seconds
         self.declare_parameter("yaw_scan_done_topic", "/yaw_scan_done")
         self.declare_parameter("scan_duration_s", 35.0)   # fallback: auto-advance SCAN after this many seconds
         self.declare_parameter("controller_state_topic", "/drone_controller/state_voo")
@@ -863,19 +863,22 @@ class PadWaypointSupervisor(Node):
             # Standalone mode: should not normally reach this state, but handle
             # it defensively in case the state is entered via an external trigger.
             if not self.use_mission_cycle_done:
+                self.get_logger().warning(
+                    "[WAIT_MISSION_DONE] Reached in standalone mode (use_mission_cycle_done=False). "
+                    "This indicates an unexpected state transition — forcing immediate progress."
+                )
                 self.mission_cycle_done = True
 
             # Optional timeout: force progress if handshake never arrives.
-            if (not self.mission_cycle_done
-                    and self.mission_cycle_timeout_s > 0.0
-                    and (time.monotonic() - self._wait_mission_start_t) >= self.mission_cycle_timeout_s):
+            if not self.mission_cycle_done and self.mission_cycle_timeout_s > 0.0:
                 elapsed = time.monotonic() - self._wait_mission_start_t
-                self.get_logger().warning(
-                    f"[WAIT_MISSION_DONE] Timeout after {elapsed:.1f}s "
-                    f"(mission_cycle_timeout_s={self.mission_cycle_timeout_s:.1f}s) — "
-                    "/mission_cycle_done not received. Forcing progress."
-                )
-                self.mission_cycle_done = True
+                if elapsed >= self.mission_cycle_timeout_s:
+                    self.get_logger().warning(
+                        f"[WAIT_MISSION_DONE] Timeout after {elapsed:.1f}s "
+                        f"(mission_cycle_timeout_s={self.mission_cycle_timeout_s:.1f}s) — "
+                        "/mission_cycle_done not received. Forcing progress."
+                    )
+                    self.mission_cycle_done = True
 
             if not self.mission_cycle_done:
                 return
