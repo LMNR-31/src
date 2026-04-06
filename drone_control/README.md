@@ -15,12 +15,15 @@ ros2 run drone_control supervisor
 
 ### `supervisor_T`
 
-Monitors trajectory progress and, **each time** a trajectory finishes, launches
+Monitors trajectory progress and, **each time** a trajectory finishes, waits
+`wait_after_traj_done_s` seconds (default **5 s**) and then launches
 `missao_P_T`.  After the trajectory is detected as complete the guards are
 automatically reset, so the node fires again for every subsequent trajectory.
 
 ```bash
 ros2 run drone_control supervisor_T
+# custom delay:
+ros2 run drone_control supervisor_T --ros-args -p wait_after_traj_done_s:=5.0
 ```
 
 **Topics monitored:**
@@ -30,17 +33,28 @@ ros2 run drone_control supervisor_T
 | `/trajectory_progress`  | `std_msgs/Float32`   | Progress value; ≥ 100 → trajectory done; < 99.9 → new trajectory started |
 | `/trajectory_finished`  | `std_msgs/Bool`      | `true` → done; `false` → new trajectory |
 
+**Parameters:**
+
+| Parameter                | Type   | Default | Description                                         |
+|--------------------------|--------|---------|-----------------------------------------------------|
+| `uav_name`               | string | `uav1`  | UAV namespace prefix                                |
+| `use_origin_as_base`     | bool   | `true`  | Land at current XY when near origin instead of running missao_P_T |
+| `wait_after_traj_done_s` | double | `5.0`   | Seconds to wait after trajectory completion before launching next mission |
+
 **Behaviour:**
 
 1. Subscribes to `/trajectory_progress` and `/trajectory_finished`.
-2. When either signal indicates the trajectory is complete, `missao_P_T` is
-   enqueued for launch.
-3. Only **one** instance of `missao_P_T` runs at a time; extra triggers are
+2. When either signal indicates the trajectory is complete, the supervisor
+   enters the `WAIT_BEFORE_MISSION` state and logs
+   `🏁 Trajetória concluída. Aguardando X.X s antes de iniciar nova missão…`.
+3. After `wait_after_traj_done_s` seconds, it logs
+   `⏱️  X.X s concluídos — lançando missao_P_T…` and launches the mission.
+4. Only **one** instance of `missao_P_T` runs at a time; extra triggers are
    queued and processed in order.
-4. When a new trajectory starts (`/trajectory_finished == false` or
+5. When a new trajectory starts (`/trajectory_finished == false` or
    `progress < 100`) the guards reset so the next completion triggers a new
    launch.
-5. Child processes are reaped via `waitpid(WNOHANG)` to avoid zombies.
+6. Child processes are reaped via `waitpid(WNOHANG)` to avoid zombies.
 
 ### `missao_P_T`
 
