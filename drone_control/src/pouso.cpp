@@ -13,6 +13,7 @@
 //   frame_id         (string, default "map")     — coordinate frame
 //   rate_hz          (double, default  10.0)     — timer rate (Hz)
 //   check_after_sec  (double, default  15.0)     — seconds before giving up
+//   xy_hold_tol      (double, default  0.05)     — max planar error (m) to the landing target required for completion; also triggers waypoint reissue on drift
 //   use_yolo_h       (bool,   default  false)    — use YOLO H detection for landing XY
 //   h_topic          (string, default "/landing_pad/h_relative_position") — YOLO H topic
 //   h_collect_time_s (double, default  1.0)      — seconds to hover and collect H detections (COLLECT_H state) before choosing best
@@ -54,7 +55,8 @@ public:
   PousoNode()
   : Node("pouso"),
     fsm_(PousoFSM::WAIT_FCU),
-    attempt_start_(rclcpp::Time(0, 0, RCL_ROS_TIME))
+    attempt_start_(rclcpp::Time(0, 0, RCL_ROS_TIME)),
+    last_reissue_time_(rclcpp::Time(0, 0, RCL_ROS_TIME))
   {
     // ── parameters ──────────────────────────────────────────────────────────
     this->declare_parameter<std::string>("uav_name",        "uav1");
@@ -71,6 +73,7 @@ public:
     this->declare_parameter<double>     ("h_timeout_s",     0.75);
     this->declare_parameter<double>     ("max_h_range_m",   6.0);
     this->declare_parameter<bool>       ("prefer_closest_h", true);
+    this->declare_parameter<double>     ("xy_hold_tol",      0.05);
 
     uav_name_        = this->get_parameter("uav_name").as_string();
     target_x_        = this->get_parameter("x").as_double();
@@ -86,6 +89,7 @@ public:
     h_timeout_s_     = this->get_parameter("h_timeout_s").as_double();
     max_h_range_m_   = this->get_parameter("max_h_range_m").as_double();
     prefer_closest_h_ = this->get_parameter("prefer_closest_h").as_bool();
+    xy_hold_tol_      = this->get_parameter("xy_hold_tol").as_double();
 
     // ── publisher / subscribers ──────────────────────────────────────────────
     waypoints_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>("/waypoints", 10);
@@ -114,10 +118,10 @@ public:
 
     RCLCPP_INFO(this->get_logger(),
       "pouso node started. uav=%s landing_z=%.2f use_current_xy=%s "
-      "target=(%.2f, %.2f) check_after=%.1fs use_yolo_h=%s",
+      "target=(%.2f, %.2f) check_after=%.1fs xy_hold_tol=%.3fm use_yolo_h=%s",
       uav_name_.c_str(), landing_z_,
       use_current_xy_ ? "true" : "false",
-      target_x_, target_y_, check_after_sec_,
+      target_x_, target_y_, check_after_sec_, xy_hold_tol_,
       use_yolo_h_ ? "true" : "false");
   }
 
@@ -312,6 +316,27 @@ private:
       land_y = use_current_xy_ ? current_y_ : target_y_;
     }
 
+    // Remember the active landing target for XY monitoring (set once; reissues
+    // should call publishWaypointsToTarget() directly to avoid re-computing).
+    active_land_x_ = land_x;
+    active_land_y_ = land_y;
+
+    const char * fonte =
+      used_yolo_h ? "yolo-H" : (use_current_xy_ ? "odometria atual" : "parâmetros x/y");
+    RCLCPP_INFO(this->get_logger(),
+      "🛬 Ponto de pouso publicado em /waypoints:");
+    RCLCPP_INFO(this->get_logger(),
+      "   Posição XY: (%.2f, %.2f) [fonte: %s]",
+      land_x, land_y, fonte);
+
+    publishWaypointsToTarget(land_x, land_y);
+  }
+
+  // Publish a PoseArray with an approach hover WP and a ground WP to the given
+  // XY target.  Called by publishLandingWaypoints() for the initial publication
+  // and by monitorLanding() for drift-correction reissues.
+  void publishWaypointsToTarget(double land_x, double land_y)
+  {
     geometry_msgs::msg::PoseArray waypoints;
     waypoints.header.frame_id = frame_id_;
     waypoints.header.stamp    = this->now();
@@ -334,13 +359,6 @@ private:
 
     waypoints_pub_->publish(waypoints);
 
-    const char * fonte =
-      used_yolo_h ? "yolo-H" : (use_current_xy_ ? "odometria atual" : "parâmetros x/y");
-    RCLCPP_INFO(this->get_logger(),
-      "🛬 Ponto de pouso publicado em /waypoints:");
-    RCLCPP_INFO(this->get_logger(),
-      "   Posição XY: (%.2f, %.2f) [fonte: %s]",
-      land_x, land_y, fonte);
     RCLCPP_INFO(this->get_logger(),
       "   WP[0]: X=%.2f Y=%.2f Z=%.2f (hover de aproximação)",
       wp_approach.position.x, wp_approach.position.y, wp_approach.position.z);
@@ -351,23 +369,47 @@ private:
 
   void monitorLanding()
   {
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "⬇️  Descendo… altitude atual Z=%.2f m (alvo=%.2f m)",
-      current_z_, landing_z_);
+    double dxy = std::hypot(current_x_ - active_land_x_, current_y_ - active_land_y_);
+    bool z_ok  = (current_z_ <= landing_z_ + 0.15);
+    bool xy_ok = (dxy <= xy_hold_tol_);
 
-    if (current_z_ <= landing_z_ + 0.15) {
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+      "⬇️  Descendo… Z=%.2f m (alvo=%.2f m) | dxy=%.3f m (xy_hold_tol=%.3f m) XY=%s",
+      current_z_, landing_z_, dxy, xy_hold_tol_, xy_ok ? "OK" : "FORA");
+
+    if (z_ok && xy_ok) {
       RCLCPP_INFO(this->get_logger(),
-        "✅ Pouso concluído: Z=%.2f m ≤ %.2f m. Encerrando.",
-        current_z_, landing_z_ + 0.15);
+        "✅ Pouso concluído: Z=%.2f m ≤ %.2f m, dxy=%.3f m ≤ xy_hold_tol=%.3f m. Encerrando.",
+        current_z_, landing_z_ + 0.15, dxy, xy_hold_tol_);
       rclcpp::shutdown();
       return;
+    }
+
+    if (z_ok && !xy_ok) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "⚠️  Z atingido mas XY fora do alvo: dxy=%.3f m > xy_hold_tol=%.3f m. "
+        "Conclusão de pouso bloqueada por erro XY.",
+        dxy, xy_hold_tol_);
+    }
+
+    if (!xy_ok) {
+      // Reissue landing waypoints to pull drone back to centre (throttled to 2 s)
+      double since_reissue = (this->now() - last_reissue_time_).seconds();
+      if (since_reissue >= 2.0) {
+        RCLCPP_WARN(this->get_logger(),
+          "⚠️  Drone desviou do alvo: dxy=%.3f m > xy_hold_tol=%.3f m. "
+          "Republicando waypoints de pouso.",
+          dxy, xy_hold_tol_);
+        publishWaypointsToTarget(active_land_x_, active_land_y_);
+        last_reissue_time_ = this->now();
+      }
     }
 
     double elapsed = (this->now() - attempt_start_).seconds();
     if (elapsed >= check_after_sec_) {
       RCLCPP_WARN(this->get_logger(),
-        "⚠️  Timeout aguardando pouso (%.1fs): Z=%.2f m. Encerrando.",
-        check_after_sec_, current_z_);
+        "⚠️  Timeout aguardando pouso (%.1fs): Z=%.2f m, dxy=%.3f m. Encerrando.",
+        check_after_sec_, current_z_, dxy);
       rclcpp::shutdown();
     }
   }
@@ -389,11 +431,14 @@ private:
   double current_y_     {0.0};
   double current_z_     {0.0};
   double current_yaw_   {0.0};
+  double active_land_x_ {0.0};  // frozen target set in publishLandingWaypoints(); valid only in MONITOR state
+  double active_land_y_ {0.0};  // frozen target set in publishLandingWaypoints(); valid only in MONITOR state
 
   std::vector<HDetection> h_detections_;
 
   rclcpp::Time attempt_start_;
   rclcpp::Time collect_start_;
+  rclcpp::Time last_reissue_time_;
   int          h_collect_count_ {0};
   bool         has_best_h_      {false};
   HDetection   best_collected_h_;
@@ -406,6 +451,7 @@ private:
   double      landing_z_;
   std::string frame_id_;
   double      check_after_sec_;
+  double      xy_hold_tol_;
   bool        use_yolo_h_;
   std::string h_topic_;
   double      h_collect_time_s_;
