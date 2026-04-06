@@ -422,6 +422,16 @@ private:
   /// Loop guard: skip the next /waypoints message coming from our own publisher.
   int skip_self_waypoints_count_{0};
 
+  // ── Configurable topic names ─────────────────────────────────────────────
+  /// Topic on which incoming waypoint-array commands are received.
+  std::string waypoints_cmd_topic_{"/waypoints"};
+  /// Topic on which the current trajectory is re-published for monitoring.
+  std::string waypoints_status_topic_{"/waypoints"};
+  /// Topic on which incoming waypoint-goal commands are received.
+  std::string waypoint_goal_cmd_topic_{"/waypoint_goal"};
+  /// Topic on which the current waypoint goal is re-published for monitoring.
+  std::string waypoint_goal_status_topic_{"/waypoint_goal"};
+
   // ── Monitoring heartbeat parameters ──────────────────────────────────────
   /// Rate (Hz) at which /waypoint_goal is re-published as a heartbeat.
   double monitor_waypoint_goal_rate_hz_{5.0};

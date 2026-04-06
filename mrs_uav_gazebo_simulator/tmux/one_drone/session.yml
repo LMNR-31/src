@@ -90,6 +90,13 @@ windows:
           waitForGazebo; sleep 5
           waitForPX4; sleep 2
           source ~/ros2_ws/install/setup.bash
+          # To avoid publisher conflicts with pad_waypoint_supervisor set:
+          #   waypoints_cmd_topic:=/waypoints_cmd      (supervisor publishes here)
+          #   waypoints_status_topic:=/waypoints_status (controller echo goes here)
+          # Example: ros2 run my_drone_controller drone_node --ros-args \
+          #   --params-file $DRONE_CONFIG \
+          #   -p waypoints_cmd_topic:=/waypoints_cmd \
+          #   -p waypoints_status_topic:=/waypoints_status
           ros2 run my_drone_controller drone_node --ros-args --params-file $DRONE_CONFIG 2>&1 | tee -a /tmp/drone_logs/drone_controller_$(date +%Y%m%d_%H%M%S).log
 
  
