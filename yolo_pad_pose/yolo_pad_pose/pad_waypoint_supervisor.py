@@ -328,6 +328,7 @@ class PadWaypointSupervisor(Node):
 
     def _pick_next_target(self) -> Optional[Tuple[float, float]]:
         # Debug: log full candidate list each time we pick
+        now = time.time()
         self.get_logger().info(
             f"[PICK] Candidate list ({len(self.candidates)} total, "
             f"visited_positions={len(self.visited_positions)}):"
@@ -337,9 +338,11 @@ class PadWaypointSupervisor(Node):
                 math.hypot(c.x - vx, c.y - vy) <= self.repeat_block_m
                 for vx, vy in self.visited_positions
             )
+            age_s = now - c.last_seen_s
             self.get_logger().info(
                 f"[PICK]   #{i}: map=({c.x:.2f},{c.y:.2f}) "
-                f"seen={c.seen_count} visited={c.visited} blocked={blocked}"
+                f"seen={c.seen_count} age={age_s:.1f}s "
+                f"visited={c.visited} blocked={blocked}"
             )
 
         # Choose nearest unvisited candidate with enough evidence
