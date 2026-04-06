@@ -99,6 +99,39 @@ void DroneControllerCompleto::load_parameters()
     "⚙️  publish_state_voo=%s  state_voo_pub_rate_hz=%.1f",
     publish_state_voo_ ? "true" : "false", state_voo_pub_rate_hz_);
 
+  // ── Topic-name parameters (separates command-input from status-output) ───
+  this->declare_parameter<std::string>("waypoints_cmd_topic",        "/waypoints");
+  this->declare_parameter<std::string>("waypoints_status_topic",     "/waypoints");
+  this->declare_parameter<std::string>("waypoint_goal_cmd_topic",    "/waypoint_goal");
+  this->declare_parameter<std::string>("waypoint_goal_status_topic", "/waypoint_goal");
+  waypoints_cmd_topic_        = this->get_parameter("waypoints_cmd_topic").as_string();
+  waypoints_status_topic_     = this->get_parameter("waypoints_status_topic").as_string();
+  waypoint_goal_cmd_topic_    = this->get_parameter("waypoint_goal_cmd_topic").as_string();
+  waypoint_goal_status_topic_ = this->get_parameter("waypoint_goal_status_topic").as_string();
+  RCLCPP_INFO(this->get_logger(),
+    "⚙️  waypoints_cmd_topic=%s  waypoints_status_topic=%s",
+    waypoints_cmd_topic_.c_str(), waypoints_status_topic_.c_str());
+  RCLCPP_INFO(this->get_logger(),
+    "⚙️  waypoint_goal_cmd_topic=%s  waypoint_goal_status_topic=%s",
+    waypoint_goal_cmd_topic_.c_str(), waypoint_goal_status_topic_.c_str());
+  if (waypoints_cmd_topic_ == waypoints_status_topic_) {
+    RCLCPP_WARN(this->get_logger(),
+      "⚠️  waypoints_cmd_topic == waypoints_status_topic ('%s'): "
+      "using the same topic for command input and status output may cause "
+      "publisher conflicts when other nodes (e.g. pad_waypoint_supervisor) "
+      "also publish waypoints. Consider setting waypoints_status_topic to "
+      "'/waypoints_status'.",
+      waypoints_cmd_topic_.c_str());
+  }
+  if (waypoint_goal_cmd_topic_ == waypoint_goal_status_topic_) {
+    RCLCPP_WARN(this->get_logger(),
+      "⚠️  waypoint_goal_cmd_topic == waypoint_goal_status_topic ('%s'): "
+      "using the same topic for command input and status output may cause "
+      "publisher conflicts. Consider setting waypoint_goal_status_topic to "
+      "'/waypoint_goal_status'.",
+      waypoint_goal_cmd_topic_.c_str());
+  }
+
   param_cb_handle_ = this->add_on_set_parameters_callback(
     std::bind(&DroneControllerCompleto::onSetParameters, this, std::placeholders::_1));
 
@@ -126,8 +159,9 @@ void DroneControllerCompleto::setup_publishers()
   mission_latch_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
     "/mission_latch_pose", 10);
   waypoint_goal_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
-    "/waypoint_goal", 10);
-  waypoints_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>("/waypoints", 10);
+    waypoint_goal_status_topic_, 10);
+  waypoints_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>(
+    waypoints_status_topic_, 10);
   state_voo_pub_ = this->create_publisher<std_msgs::msg::Int32>(
     "/drone_controller/state_voo", rclcpp::QoS(1).transient_local());
   RCLCPP_INFO(this->get_logger(), "✓ Publisher criado: /uav1/mavros/setpoint_raw/local");
@@ -135,8 +169,8 @@ void DroneControllerCompleto::setup_publishers()
   RCLCPP_INFO(this->get_logger(), "✓ Publisher criado: /trajectory_progress");
   RCLCPP_INFO(this->get_logger(), "✓ Publisher criado: /waypoint_reached");
   RCLCPP_INFO(this->get_logger(), "✓ Publisher criado: /mission_latch_pose");
-  RCLCPP_INFO(this->get_logger(), "✓ Publisher criado: /waypoint_goal");
-  RCLCPP_INFO(this->get_logger(), "✓ Publisher criado: /waypoints");
+  RCLCPP_INFO(this->get_logger(), "✓ Publisher criado (status): %s", waypoint_goal_status_topic_.c_str());
+  RCLCPP_INFO(this->get_logger(), "✓ Publisher criado (status): %s", waypoints_status_topic_.c_str());
   RCLCPP_INFO(this->get_logger(), "✓ Publisher criado: /drone_controller/state_voo");
 }
 
@@ -155,7 +189,7 @@ void DroneControllerCompleto::setup_subscribers()
     });
 
   waypoints_sub_ = this->create_subscription<geometry_msgs::msg::PoseArray>(
-    "/waypoints", 1,
+    waypoints_cmd_topic_, 1,
     std::bind(&DroneControllerCompleto::waypoints_callback, this, std::placeholders::_1));
 
   mission_waypoints_sub_ = this->create_subscription<geometry_msgs::msg::PoseArray>(
@@ -163,7 +197,7 @@ void DroneControllerCompleto::setup_subscribers()
     std::bind(&DroneControllerCompleto::mission_waypoints_callback, this, std::placeholders::_1));
 
   waypoint_goal_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
-    "/waypoint_goal", 1,
+    waypoint_goal_cmd_topic_, 1,
     std::bind(&DroneControllerCompleto::waypoint_goal_callback, this, std::placeholders::_1));
 
   odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
@@ -187,9 +221,10 @@ void DroneControllerCompleto::setup_subscribers()
     std::bind(&DroneControllerCompleto::mission_interrupt_done_callback, this, std::placeholders::_1));
 
   RCLCPP_INFO(this->get_logger(),
-    "✓ Subscribers criados: /uav1/mavros/state, /uav1/mavros/extended_state, /waypoints, "
-    "/mission_waypoints, /waypoint_goal, odometria, /uav1/yaw_override/cmd, "
-    "/waypoint_goal_4d, /waypoints_4d e /mission_interrupt_done");
+    "✓ Subscribers criados: /uav1/mavros/state, /uav1/mavros/extended_state, "
+    "%s (cmd), /mission_waypoints, %s (cmd), odometria, /uav1/yaw_override/cmd, "
+    "/waypoint_goal_4d, /waypoints_4d e /mission_interrupt_done",
+    waypoints_cmd_topic_.c_str(), waypoint_goal_cmd_topic_.c_str());
 }
 
 void DroneControllerCompleto::setup_services()
@@ -222,7 +257,7 @@ void DroneControllerCompleto::setup_services()
       period_ms,
       std::bind(&DroneControllerCompleto::monitor_waypoint_goal_heartbeat, this));
     RCLCPP_INFO(this->get_logger(),
-      "✓ Heartbeat /waypoint_goal: %.1f Hz", monitor_waypoint_goal_rate_hz_);
+      "✓ Heartbeat (status→%s): %.1f Hz", waypoint_goal_status_topic_.c_str(), monitor_waypoint_goal_rate_hz_);
   }
   if (monitor_waypoints_rate_hz_ > 0.0) {
     auto period_ms = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -231,7 +266,7 @@ void DroneControllerCompleto::setup_services()
       period_ms,
       std::bind(&DroneControllerCompleto::monitor_waypoints_heartbeat, this));
     RCLCPP_INFO(this->get_logger(),
-      "✓ Heartbeat /waypoints: %.1f Hz", monitor_waypoints_rate_hz_);
+      "✓ Heartbeat (status→%s): %.1f Hz", waypoints_status_topic_.c_str(), monitor_waypoints_rate_hz_);
   }
   // ── State-voo periodic republish timer ────────────────────────────────────
   if (publish_state_voo_ && state_voo_pub_rate_hz_ > 0.0) {
@@ -1366,10 +1401,11 @@ void DroneControllerCompleto::publish_waypoint_goal_status(double x, double y, d
   msg.pose.position.x = x;
   msg.pose.position.y = y;
   msg.pose.position.z = z;
-  skip_self_waypoint_goal_count_++;
+  // Guard against receiving our own echo only when cmd and status share the same topic.
+  if (waypoint_goal_cmd_topic_ == waypoint_goal_status_topic_) { skip_self_waypoint_goal_count_++; }
   waypoint_goal_pub_->publish(msg);
   RCLCPP_INFO(this->get_logger(),
-    "📢 [/waypoint_goal] Publicado: X=%.2f, Y=%.2f, Z=%.2f", x, y, z);
+    "📢 [%s] Publicado: X=%.2f, Y=%.2f, Z=%.2f", waypoint_goal_status_topic_.c_str(), x, y, z);
 }
 
 void DroneControllerCompleto::publish_waypoints_status()
@@ -1379,11 +1415,12 @@ void DroneControllerCompleto::publish_waypoints_status()
   msg.header.stamp = this->now();
   msg.header.frame_id = "map";
   msg.poses = trajectory_waypoints_;
-  skip_self_waypoints_count_++;
+  // Guard against receiving our own echo only when cmd and status share the same topic.
+  if (waypoints_cmd_topic_ == waypoints_status_topic_) { skip_self_waypoints_count_++; }
   waypoints_pub_->publish(msg);
   RCLCPP_INFO(this->get_logger(),
-    "📢 [/waypoints] Publicando %zu waypoints de trajetória",
-    trajectory_waypoints_.size());
+    "📢 [%s] Publicando %zu waypoints de trajetória",
+    waypoints_status_topic_.c_str(), trajectory_waypoints_.size());
 }
 
 void DroneControllerCompleto::monitor_waypoint_goal_heartbeat()
@@ -1428,10 +1465,11 @@ void DroneControllerCompleto::monitor_waypoint_goal_heartbeat()
   msg.pose.position.x = x;
   msg.pose.position.y = y;
   msg.pose.position.z = z;
-  skip_self_waypoint_goal_count_++;
+  // Guard against receiving our own echo only when cmd and status share the same topic.
+  if (waypoint_goal_cmd_topic_ == waypoint_goal_status_topic_) { skip_self_waypoint_goal_count_++; }
   waypoint_goal_pub_->publish(msg);
   RCLCPP_DEBUG(this->get_logger(),
-    "[heartbeat /waypoint_goal] X=%.2f Y=%.2f Z=%.2f", x, y, z);
+    "[heartbeat %s] X=%.2f Y=%.2f Z=%.2f", waypoint_goal_status_topic_.c_str(), x, y, z);
 }
 
 void DroneControllerCompleto::monitor_waypoints_heartbeat()
@@ -1445,10 +1483,11 @@ void DroneControllerCompleto::monitor_waypoints_heartbeat()
   msg.header.stamp = this->now();
   msg.header.frame_id = "map";
   msg.poses = trajectory_waypoints_;
-  skip_self_waypoints_count_++;
+  // Guard against receiving our own echo only when cmd and status share the same topic.
+  if (waypoints_cmd_topic_ == waypoints_status_topic_) { skip_self_waypoints_count_++; }
   waypoints_pub_->publish(msg);
   RCLCPP_DEBUG(this->get_logger(),
-    "[heartbeat /waypoints] %zu waypoints", trajectory_waypoints_.size());
+    "[heartbeat %s] %zu waypoints", waypoints_status_topic_.c_str(), trajectory_waypoints_.size());
 }
 
 void DroneControllerCompleto::monitor_state_voo_heartbeat()
