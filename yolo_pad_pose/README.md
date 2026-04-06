@@ -32,6 +32,37 @@ dy_world = sin(yaw)*front - cos(yaw)*right   # = sin(yaw)*x_bl + cos(yaw)*y_bl
 where `yaw` is the heading read from `/uav1/mavros/local_position/odom`
 (standard ENU convention, CCW positive).
 
+### Standalone mode (no `/mission_cycle_done` handshake)
+
+By default the supervisor enters `WAIT_MISSION_DONE` after reaching each base
+and blocks until `supervisor_T` publishes `/mission_cycle_done=true`.  If you
+are running the node **standalone** (without `supervisor_T`), set
+`use_mission_cycle_done:=false`:
+
+```bash
+ros2 run yolo_pad_pose pad_waypoint_supervisor --ros-args \
+  -p use_mission_cycle_done:=false
+```
+
+In this mode the base is marked visited **immediately** upon reaching the target
+(within `reach_tol_m`) and the node transitions straight back to `DISCOVER`.
+
+Alternatively, keep the handshake enabled but add a safety timeout so the node
+never blocks indefinitely if the signal is lost:
+
+```bash
+ros2 run yolo_pad_pose pad_waypoint_supervisor --ros-args \
+  -p mission_cycle_timeout_s:=30.0
+```
+
+After `mission_cycle_timeout_s` seconds without the handshake, the node logs a
+warning and forces progress (marks visited, continues to next base).
+
+| Parameter                  | Type  | Default | Description |
+|----------------------------|-------|---------|-------------|
+| `use_mission_cycle_done`   | bool  | `true`  | If `false`, skip the `/mission_cycle_done` handshake entirely (standalone mode). |
+| `mission_cycle_timeout_s`  | float | `0.0`   | Seconds to wait for `/mission_cycle_done` before forcing progress. `0.0` disables the timeout. Only used when `use_mission_cycle_done=true`. |
+
 ### Parameters (axis / yaw correction)
 
 All flags default to **False** — the math is correct for the standard

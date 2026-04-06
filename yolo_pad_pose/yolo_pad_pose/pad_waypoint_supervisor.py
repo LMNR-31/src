@@ -50,6 +50,8 @@ class PadWaypointSupervisor(Node):
         self.declare_parameter("trajectory_finished_topic", "/trajectory_finished")
         self.declare_parameter("use_trajectory_finished", True)
         self.declare_parameter("mission_cycle_done_topic", "/mission_cycle_done")
+        self.declare_parameter("use_mission_cycle_done", True)
+        self.declare_parameter("mission_cycle_timeout_s", 0.0)  # 0 = disabled; >0 forces progress after this many seconds
         self.declare_parameter("yaw_scan_done_topic", "/yaw_scan_done")
         self.declare_parameter("scan_duration_s", 35.0)   # fallback: auto-advance SCAN after this many seconds
         self.declare_parameter("controller_state_topic", "/drone_controller/state_voo")
@@ -108,6 +110,8 @@ class PadWaypointSupervisor(Node):
         self.trajectory_finished_topic = self.get_parameter("trajectory_finished_topic").value
         self.use_trajectory_finished = bool(self.get_parameter("use_trajectory_finished").value)
         self.mission_cycle_done_topic = self.get_parameter("mission_cycle_done_topic").value
+        self.use_mission_cycle_done = bool(self.get_parameter("use_mission_cycle_done").value)
+        self.mission_cycle_timeout_s = float(self.get_parameter("mission_cycle_timeout_s").value)
         self.yaw_scan_done_topic = self.get_parameter("yaw_scan_done_topic").value
         self.scan_duration_s = float(self.get_parameter("scan_duration_s").value)
         self.controller_state_topic = self.get_parameter("controller_state_topic").value
@@ -158,6 +162,7 @@ class PadWaypointSupervisor(Node):
         self.trajectory_finished = False
         self._last_finished_msg_t = 0.0
         self.mission_cycle_done = False
+        self._wait_mission_start_t: float = 0.0  # time we entered WAIT_MISSION_DONE
         self.yaw_scan_done = False
         self._scan_start_t = time.time()
         self.ready_for_commands = (not self.use_trajectory_finished)
@@ -254,6 +259,9 @@ class PadWaypointSupervisor(Node):
             f" waypoints_topic={self.waypoints_topic}\n"
             f" controller_state_topic={self.controller_state_topic}\n"
             f" mission_cycle_done_topic={self.mission_cycle_done_topic}\n"
+            f" use_mission_cycle_done={self.use_mission_cycle_done} "
+            f"mission_cycle_timeout_s={self.mission_cycle_timeout_s} "
+            f"({'disabled' if self.mission_cycle_timeout_s <= 0.0 else f'{self.mission_cycle_timeout_s:.1f}s'})\n"
             f" world_frame_id={self.world_frame_id} (NOTE: treated numerically as the odom frame)\n"
             f" z_fixed={self.z_fixed}\n"
             f" bases_to_visit={self.bases_to_visit}\n"
@@ -272,6 +280,18 @@ class PadWaypointSupervisor(Node):
             f"yaw_scan_publish_hz={self.yaw_scan_publish_hz} "
             f"yaw_scan_dur={self._yaw_scan_dur_eff:.1f}s"
         )
+        if not self.use_mission_cycle_done:
+            self.get_logger().info(
+                "[STANDALONE] use_mission_cycle_done=False — "
+                "supervisor will NOT wait for /mission_cycle_done handshake. "
+                "Bases are marked visited immediately upon reaching the target."
+            )
+        elif self.mission_cycle_timeout_s > 0.0:
+            self.get_logger().info(
+                f"[HANDSHAKE] use_mission_cycle_done=True with "
+                f"mission_cycle_timeout_s={self.mission_cycle_timeout_s:.1f}s — "
+                "will force progress if handshake is not received within the timeout."
+            )
 
     def cb_finished(self, msg: Bool):
         self.trajectory_finished = bool(msg.data)
@@ -810,18 +830,53 @@ class PadWaypointSupervisor(Node):
 
             d = math.hypot(tx - self.cur_x, ty - self.cur_y)
             if d <= self.reach_tol_m:
-                self.get_logger().info(
-                    f"[STATE] Reached base within {self.reach_tol_m}m (d={d:.2f}). "
-                    "Waiting for mission cycle to complete (WAIT_MISSION_DONE).")
-                self.state = "WAIT_MISSION_DONE"
-                # Reset handshake flag to discard any stale signal that arrived
-                # before we entered this state (e.g. from the previous cycle).
-                self.mission_cycle_done = False
+                if not self.use_mission_cycle_done:
+                    # Standalone mode: mark visited immediately without waiting for handshake.
+                    visit_x = self.cur_x
+                    visit_y = self.cur_y
+                    self._mark_visited(visit_x, visit_y)
+                    self.visited_positions.append((visit_x, visit_y))
+                    self.visited_count += 1
+                    self.get_logger().info(
+                        f"[STATE] Reached base within {self.reach_tol_m}m (d={d:.2f}). "
+                        f"Standalone mode (use_mission_cycle_done=False): base marked visited at odom "
+                        f"({visit_x:.2f}, {visit_y:.2f}). "
+                        f"visited={self.visited_count}/{self.bases_to_visit}. "
+                        "Transitioning to DISCOVER.")
+                    self.active_target = None
+                    self.state = "DISCOVER"
+                else:
+                    self.get_logger().info(
+                        f"[STATE] Reached base within {self.reach_tol_m}m (d={d:.2f}). "
+                        "Waiting for mission cycle to complete (WAIT_MISSION_DONE).")
+                    self.state = "WAIT_MISSION_DONE"
+                    # Reset handshake flag to discard any stale signal that arrived
+                    # before we entered this state (e.g. from the previous cycle).
+                    self.mission_cycle_done = False
+                    self._wait_mission_start_t = time.monotonic()
                 return
 
         if self.state == "WAIT_MISSION_DONE":
             # Hold position — do not publish new navigation targets.
             # Wait until supervisor_T signals that missao_P_T has finished.
+
+            # Standalone mode: should not normally reach this state, but handle
+            # it defensively in case the state is entered via an external trigger.
+            if not self.use_mission_cycle_done:
+                self.mission_cycle_done = True
+
+            # Optional timeout: force progress if handshake never arrives.
+            if (not self.mission_cycle_done
+                    and self.mission_cycle_timeout_s > 0.0
+                    and (time.monotonic() - self._wait_mission_start_t) >= self.mission_cycle_timeout_s):
+                elapsed = time.monotonic() - self._wait_mission_start_t
+                self.get_logger().warning(
+                    f"[WAIT_MISSION_DONE] Timeout after {elapsed:.1f}s "
+                    f"(mission_cycle_timeout_s={self.mission_cycle_timeout_s:.1f}s) — "
+                    "/mission_cycle_done not received. Forcing progress."
+                )
+                self.mission_cycle_done = True
+
             if not self.mission_cycle_done:
                 return
 
