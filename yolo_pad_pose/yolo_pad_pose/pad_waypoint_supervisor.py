@@ -43,6 +43,11 @@ class PadWaypointSupervisor(Node):
     during this pause the node stays quiet (no waypoint publishes) but
     continues accumulating detections.
 
+    When enable_h_centering is True, the final approach to each base uses
+    the H marker topic (/landing_pad/h_relative_position) to refine the
+    commanded target and ensure the drone centers on the pad before marking
+    the base as reached.
+
     FSM states: COLLECT → NAVIGATE → WAIT_BETWEEN_BASES → RETURN_HOME → DONE
     """
 
@@ -52,6 +57,7 @@ class PadWaypointSupervisor(Node):
         # ── Parameters ───────────────────────────────────────────────────────
         self.declare_parameter("odom_topic", "/uav1/mavros/local_position/odom")
         self.declare_parameter("base_det_topic", "/landing_pad/base_relative_position")
+        self.declare_parameter("h_det_topic", "/landing_pad/h_relative_position")
         self.declare_parameter("waypoints_topic", "/waypoints")
         self.declare_parameter("controller_state_topic", "/drone_controller/state_voo")
 
@@ -76,9 +82,17 @@ class PadWaypointSupervisor(Node):
         # Stale candidate pruning (unvisited only)
         self.declare_parameter("candidate_timeout_s", 120.0)
 
+        # H-marker centering parameters
+        self.declare_parameter("enable_h_centering", True)
+        self.declare_parameter("centering_start_dist_m", 0.6)
+        self.declare_parameter("centering_reach_tol_m", 0.05)
+        self.declare_parameter("h_timeout_s", 0.5)
+        self.declare_parameter("max_h_range_m", 6.0)
+
         # ── Read parameters ───────────────────────────────────────────────────
         self.odom_topic = self.get_parameter("odom_topic").value
         self.base_det_topic = self.get_parameter("base_det_topic").value
+        self.h_det_topic = self.get_parameter("h_det_topic").value
         self.waypoints_topic = self.get_parameter("waypoints_topic").value
         self.controller_state_topic = self.get_parameter("controller_state_topic").value
 
@@ -98,6 +112,14 @@ class PadWaypointSupervisor(Node):
         self.max_jump_m = float(self.get_parameter("max_jump_m").value)
         self.repeat_block_m = float(self.get_parameter("repeat_block_m").value)
         self.candidate_timeout_s = float(self.get_parameter("candidate_timeout_s").value)
+
+        self.enable_h_centering = bool(self.get_parameter("enable_h_centering").value)
+        self.centering_start_dist_m = float(
+            self.get_parameter("centering_start_dist_m").value)
+        self.centering_reach_tol_m = float(
+            self.get_parameter("centering_reach_tol_m").value)
+        self.h_timeout_s = float(self.get_parameter("h_timeout_s").value)
+        self.max_h_range_m = float(self.get_parameter("max_h_range_m").value)
 
         # ── Runtime state ─────────────────────────────────────────────────────
         self.have_odom: bool = False
@@ -120,17 +142,26 @@ class PadWaypointSupervisor(Node):
         self._last_det_right: Optional[float] = None
         self._last_det_front: Optional[float] = None
 
+        # Latest H-marker detection (body frame) and its timestamp
+        self._last_h_right: Optional[float] = None
+        self._last_h_front: Optional[float] = None
+        self._last_h_t: float = 0.0
+
         # FSM: COLLECT → NAVIGATE → WAIT_BETWEEN_BASES → RETURN_HOME → DONE
         self.state: str = "COLLECT"
         self._wait_start_t: float = 0.0   # monotonic time when WAIT_BETWEEN_BASES started
 
-        self._last_det_info_t: float = 0.0   # throttle detection log to 1 Hz
+        self._last_det_info_t: float = 0.0      # throttle detection log to 1 Hz
+        self._last_centering_info_t: float = 0.0  # throttle centering-active log
+        self._last_h_stale_warn_t: float = 0.0   # throttle stale-H warning
 
         # ── ROS I/O ───────────────────────────────────────────────────────────
         self.sub_odom = self.create_subscription(
             Odometry, self.odom_topic, self.cb_odom, 10)
         self.sub_base = self.create_subscription(
             PointStamped, self.base_det_topic, self.cb_det, 10)
+        self.sub_h = self.create_subscription(
+            PointStamped, self.h_det_topic, self.cb_h_det, 10)
         self.sub_state_voo = self.create_subscription(
             Int32, self.controller_state_topic, self.cb_state_voo,
             rclpy.qos.QoSProfile(
@@ -148,6 +179,7 @@ class PadWaypointSupervisor(Node):
             "pad_waypoint_supervisor started (simplified).\n"
             f"  odom_topic={self.odom_topic}\n"
             f"  base_det_topic={self.base_det_topic}\n"
+            f"  h_det_topic={self.h_det_topic}\n"
             f"  waypoints_topic={self.waypoints_topic}\n"
             f"  controller_state_topic={self.controller_state_topic}\n"
             f"  world_frame_id={self.world_frame_id}  z_fixed={self.z_fixed}\n"
@@ -157,7 +189,12 @@ class PadWaypointSupervisor(Node):
             f"  max_detection_range_m={self.max_detection_range_m}"
             f"  max_jump_m={self.max_jump_m}\n"
             f"  repeat_block_m={self.repeat_block_m}"
-            f"  candidate_timeout_s={self.candidate_timeout_s}"
+            f"  candidate_timeout_s={self.candidate_timeout_s}\n"
+            f"  enable_h_centering={self.enable_h_centering}"
+            f"  centering_start_dist_m={self.centering_start_dist_m}\n"
+            f"  centering_reach_tol_m={self.centering_reach_tol_m}"
+            f"  h_timeout_s={self.h_timeout_s}"
+            f"  max_h_range_m={self.max_h_range_m}"
         )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
@@ -239,6 +276,22 @@ class PadWaypointSupervisor(Node):
                 f"candidates={len(self.candidates)} max_seen={max_seen} "
                 f"state={self.state} state_voo={self.state_voo}"
             )
+
+    def cb_h_det(self, msg: PointStamped):
+        """Store the latest H-marker detection (body frame) for centering."""
+        if not self.have_odom:
+            return
+        if self.state == "DONE":
+            return
+        self._last_h_right = float(msg.point.x)
+        self._last_h_front = float(msg.point.y)
+        self._last_h_t = time.monotonic()
+
+    def _is_h_fresh(self) -> bool:
+        """Return True if a recent H detection is available within h_timeout_s."""
+        if self._last_h_right is None:
+            return False
+        return (time.monotonic() - self._last_h_t) <= self.h_timeout_s
 
     # ── Candidate management ───────────────────────────────────────────────────
 
@@ -370,23 +423,77 @@ class PadWaypointSupervisor(Node):
 
             tx, ty = self.active_target
 
+            # ── H-marker centering ────────────────────────────────────────────
+            # When close to the active base and H is fresh, refine the commanded
+            # target using the H marker world-frame position.
+            d_base = math.hypot(tx - self.cur_x, ty - self.cur_y)
+            centering_active = False
+            cmd_x, cmd_y = tx, ty
+            hx, hy = tx, ty  # will be overwritten if centering is active
+
+            if self.enable_h_centering and d_base <= self.centering_start_dist_m:
+                if self._is_h_fresh():
+                    h_range = math.hypot(self._last_h_right, self._last_h_front)
+                    if h_range <= self.max_h_range_m:
+                        yaw = self.cur_yaw
+                        hx = (self.cur_x
+                              + self._last_h_front * math.cos(yaw)
+                              + self._last_h_right * math.sin(yaw))
+                        hy = (self.cur_y
+                              + self._last_h_front * math.sin(yaw)
+                              - self._last_h_right * math.cos(yaw))
+                        cmd_x, cmd_y = hx, hy
+                        centering_active = True
+                        now_m = time.monotonic()
+                        if now_m - self._last_centering_info_t >= 1.0:
+                            self._last_centering_info_t = now_m
+                            self.get_logger().info(
+                                f"[CENTER] Centering on H marker: "
+                                f"hx={hx:.2f} hy={hy:.2f} "
+                                f"d_base={d_base:.2f}m"
+                            )
+                else:
+                    now_m = time.monotonic()
+                    if now_m - self._last_h_stale_warn_t >= 2.0:
+                        self._last_h_stale_warn_t = now_m
+                        self.get_logger().warn(
+                            f"[CENTER] H detection stale - cannot center "
+                            f"(d_base={d_base:.2f}m). Falling back to base center."
+                        )
+
             # Only publish when the controller is in HOVER (state_voo == 2)
             if self.state_voo == 2:
-                self._publish_waypoint(tx, ty)
+                self._publish_waypoint(cmd_x, cmd_y)
 
-            d = math.hypot(tx - self.cur_x, ty - self.cur_y)
-            if d <= self.reach_tol_m:
-                # Mark base as visited using the actual odom position
-                self._mark_visited_at_odom()
-                self.visited_count += 1
-                self.get_logger().info(
-                    f"[STATE] Reached base #{self.visited_count} within {self.reach_tol_m}m "
-                    f"(d={d:.2f}m) at odom ({self.cur_x:.2f}, {self.cur_y:.2f}). "
-                    f"Entering inter-base wait ({self.inter_base_wait_s:.1f}s)."
-                )
-                self._wait_start_t = time.monotonic()
-                self.active_target = None
-                self.state = "WAIT_BETWEEN_BASES"
+            # Reach check: use H centering tolerance when centering, else base tol
+            if centering_active:
+                d_center = math.hypot(hx - self.cur_x, hy - self.cur_y)
+                if d_center <= self.centering_reach_tol_m:
+                    self._mark_visited_at_odom()
+                    self.visited_count += 1
+                    self.get_logger().info(
+                        f"[STATE] Reached base #{self.visited_count} via H centering "
+                        f"(d_center={d_center:.3f}m ≤ {self.centering_reach_tol_m}m) "
+                        f"at odom ({self.cur_x:.2f}, {self.cur_y:.2f}). "
+                        f"Entering inter-base wait ({self.inter_base_wait_s:.1f}s)."
+                    )
+                    self._wait_start_t = time.monotonic()
+                    self.active_target = None
+                    self.state = "WAIT_BETWEEN_BASES"
+            else:
+                d = math.hypot(cmd_x - self.cur_x, cmd_y - self.cur_y)
+                if d <= self.reach_tol_m:
+                    # Mark base as visited using the actual odom position
+                    self._mark_visited_at_odom()
+                    self.visited_count += 1
+                    self.get_logger().info(
+                        f"[STATE] Reached base #{self.visited_count} within {self.reach_tol_m}m "
+                        f"(d={d:.2f}m) at odom ({self.cur_x:.2f}, {self.cur_y:.2f}). "
+                        f"Entering inter-base wait ({self.inter_base_wait_s:.1f}s)."
+                    )
+                    self._wait_start_t = time.monotonic()
+                    self.active_target = None
+                    self.state = "WAIT_BETWEEN_BASES"
             return
 
         if self.state == "WAIT_BETWEEN_BASES":
