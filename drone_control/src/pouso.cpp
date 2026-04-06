@@ -13,6 +13,11 @@
 //   frame_id        (string, default "map")     — coordinate frame
 //   rate_hz         (double, default  10.0)     — timer rate (Hz)
 //   check_after_sec (double, default  15.0)     — seconds before giving up
+//   use_yolo_h      (bool,   default  false)    — use YOLO H detection for landing XY
+//   h_topic         (string, default "/landing_pad/h_relative_position") — YOLO H topic
+//   h_timeout_s     (double, default  0.75)     — max age (s) of a valid H detection
+//   max_h_range_m   (double, default  6.0)      — max planar range (m) to accept a detection
+//   prefer_closest_h (bool,  default  true)     — pick H closest to drone; false = latest
 //
 // Published topics
 //   /waypoints  [geometry_msgs/PoseArray]   — consumed by my_drone_controller
@@ -20,15 +25,27 @@
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/pose.hpp>
+#include <geometry_msgs/msg/point_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <mavros_msgs/msg/state.hpp>
 #include <mavros_msgs/srv/set_mode.hpp>
 #include <chrono>
+#include <cmath>
+#include <vector>
+#include <algorithm>
 
 using namespace std::chrono_literals;
 using std::placeholders::_1;
 
 enum class PousoFSM { WAIT_FCU, WAIT_ODOM, PUBLISH, MONITOR };
+
+struct HDetection
+{
+  rclcpp::Time stamp;
+  double right;
+  double front;
+  double range;
+};
 
 class PousoNode : public rclcpp::Node
 {
@@ -47,6 +64,11 @@ public:
     this->declare_parameter<std::string>("frame_id",        "map");
     this->declare_parameter<double>     ("rate_hz",         10.0);
     this->declare_parameter<double>     ("check_after_sec", 15.0);
+    this->declare_parameter<bool>       ("use_yolo_h",      false);
+    this->declare_parameter<std::string>("h_topic",         "/landing_pad/h_relative_position");
+    this->declare_parameter<double>     ("h_timeout_s",     0.75);
+    this->declare_parameter<double>     ("max_h_range_m",   6.0);
+    this->declare_parameter<bool>       ("prefer_closest_h", true);
 
     uav_name_        = this->get_parameter("uav_name").as_string();
     target_x_        = this->get_parameter("x").as_double();
@@ -56,6 +78,11 @@ public:
     frame_id_        = this->get_parameter("frame_id").as_string();
     check_after_sec_ = this->get_parameter("check_after_sec").as_double();
     double rate_hz   = this->get_parameter("rate_hz").as_double();
+    use_yolo_h_      = this->get_parameter("use_yolo_h").as_bool();
+    h_topic_         = this->get_parameter("h_topic").as_string();
+    h_timeout_s_     = this->get_parameter("h_timeout_s").as_double();
+    max_h_range_m_   = this->get_parameter("max_h_range_m").as_double();
+    prefer_closest_h_ = this->get_parameter("prefer_closest_h").as_bool();
 
     // ── publisher / subscribers ──────────────────────────────────────────────
     waypoints_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>("/waypoints", 10);
@@ -71,6 +98,12 @@ public:
       "/" + uav_name_ + "/mavros/local_position/odom", 10,
       std::bind(&PousoNode::odomCallback, this, _1));
 
+    if (use_yolo_h_) {
+      h_sub_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
+        h_topic_, 10,
+        std::bind(&PousoNode::hCallback, this, _1));
+    }
+
     auto period_ms = std::chrono::milliseconds(
       static_cast<int>(1000.0 / rate_hz));
     timer_ = this->create_wall_timer(
@@ -78,10 +111,11 @@ public:
 
     RCLCPP_INFO(this->get_logger(),
       "pouso node started. uav=%s landing_z=%.2f use_current_xy=%s "
-      "target=(%.2f, %.2f) check_after=%.1fs",
+      "target=(%.2f, %.2f) check_after=%.1fs use_yolo_h=%s",
       uav_name_.c_str(), landing_z_,
       use_current_xy_ ? "true" : "false",
-      target_x_, target_y_, check_after_sec_);
+      target_x_, target_y_, check_after_sec_,
+      use_yolo_h_ ? "true" : "false");
   }
 
 private:
@@ -97,7 +131,38 @@ private:
     current_x_ = msg->pose.pose.position.x;
     current_y_ = msg->pose.pose.position.y;
     current_z_ = msg->pose.pose.position.z;
+    // Extract yaw from quaternion (ENU convention)
+    const auto & q = msg->pose.pose.orientation;
+    current_yaw_ = std::atan2(
+      2.0 * (q.w * q.z + q.x * q.y),
+      1.0 - 2.0 * (q.y * q.y + q.z * q.z));
     odom_received_ = true;
+  }
+
+  void hCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg)
+  {
+    double right = msg->point.x;
+    double front = msg->point.y;
+    double range = std::hypot(right, front);
+
+    if (range > max_h_range_m_) {
+      RCLCPP_DEBUG(this->get_logger(),
+        "[yolo_h] Ignorado: range=%.2fm > max=%.2fm right=%.2f front=%.2f",
+        range, max_h_range_m_, right, front);
+      return;
+    }
+
+    h_detections_.push_back({this->now(), right, front, range});
+
+    // Prune detections older than h_timeout_s_
+    rclcpp::Time now = this->now();
+    h_detections_.erase(
+      std::remove_if(
+        h_detections_.begin(), h_detections_.end(),
+        [&](const HDetection & d) {
+          return (now - d.stamp).seconds() > h_timeout_s_;
+        }),
+      h_detections_.end());
   }
 
   // ── FSM timer ──────────────────────────────────────────────────────────────
@@ -170,8 +235,51 @@ private:
 
   void publishLandingWaypoints()
   {
-    double land_x = use_current_xy_ ? current_x_ : target_x_;
-    double land_y = use_current_xy_ ? current_y_ : target_y_;
+    double land_x;
+    double land_y;
+    bool used_yolo_h = false;
+
+    if (use_yolo_h_) {
+      // Find best H detection among those within h_timeout_s_
+      rclcpp::Time now = this->now();
+      const HDetection * best = nullptr;
+      for (const auto & d : h_detections_) {
+        if ((now - d.stamp).seconds() > h_timeout_s_) {
+          continue;
+        }
+        if (best == nullptr) {
+          best = &d;
+          continue;
+        }
+        if (prefer_closest_h_) {
+          if (d.range < best->range) {best = &d;}
+        } else {
+          if (d.stamp > best->stamp) {best = &d;}
+        }
+      }
+
+      if (best != nullptr) {
+        double yaw = current_yaw_;
+        double dx  = std::cos(yaw) * best->front + std::sin(yaw) * best->right;
+        double dy  = std::sin(yaw) * best->front - std::cos(yaw) * best->right;
+        land_x = current_x_ + dx;
+        land_y = current_y_ + dy;
+        used_yolo_h = true;
+        RCLCPP_INFO(this->get_logger(),
+          "[yolo_h] Alvo YOLO-H: XY=(%.2f, %.2f) | right=%.2f front=%.2f "
+          "range=%.2f yaw=%.3frad",
+          land_x, land_y, best->right, best->front, best->range, yaw);
+      } else {
+        RCLCPP_WARN(this->get_logger(),
+          "[yolo_h] Nenhuma detecção H válida nos últimos %.2fs. "
+          "Usando fallback (odometria/parâmetros).", h_timeout_s_);
+        land_x = use_current_xy_ ? current_x_ : target_x_;
+        land_y = use_current_xy_ ? current_y_ : target_y_;
+      }
+    } else {
+      land_x = use_current_xy_ ? current_x_ : target_x_;
+      land_y = use_current_xy_ ? current_y_ : target_y_;
+    }
 
     geometry_msgs::msg::PoseArray waypoints;
     waypoints.header.frame_id = frame_id_;
@@ -195,12 +303,13 @@ private:
 
     waypoints_pub_->publish(waypoints);
 
+    const char * fonte =
+      used_yolo_h ? "yolo-H" : (use_current_xy_ ? "odometria atual" : "parâmetros x/y");
     RCLCPP_INFO(this->get_logger(),
       "🛬 Ponto de pouso publicado em /waypoints:");
     RCLCPP_INFO(this->get_logger(),
       "   Posição XY: (%.2f, %.2f) [fonte: %s]",
-      land_x, land_y,
-      use_current_xy_ ? "odometria atual" : "parâmetros x/y");
+      land_x, land_y, fonte);
     RCLCPP_INFO(this->get_logger(),
       "   WP[0]: X=%.2f Y=%.2f Z=%.2f (hover de aproximação)",
       wp_approach.position.x, wp_approach.position.y, wp_approach.position.z);
@@ -236,17 +345,21 @@ private:
 
   PousoFSM fsm_;
 
-  rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr waypoints_pub_;
-  rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr    state_sub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr    odom_sub_;
-  rclcpp::TimerBase::SharedPtr                                timer_;
-  rclcpp::Client<mavros_msgs::srv::SetMode>::SharedPtr        set_mode_client_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr                waypoints_pub_;
+  rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr                   state_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr                   odom_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr          h_sub_;
+  rclcpp::TimerBase::SharedPtr                                               timer_;
+  rclcpp::Client<mavros_msgs::srv::SetMode>::SharedPtr                       set_mode_client_;
 
   bool   fcu_connected_ {false};
   bool   odom_received_ {false};
   double current_x_     {0.0};
   double current_y_     {0.0};
   double current_z_     {0.0};
+  double current_yaw_   {0.0};
+
+  std::vector<HDetection> h_detections_;
 
   rclcpp::Time attempt_start_;
 
@@ -258,6 +371,11 @@ private:
   double      landing_z_;
   std::string frame_id_;
   double      check_after_sec_;
+  bool        use_yolo_h_;
+  std::string h_topic_;
+  double      h_timeout_s_;
+  double      max_h_range_m_;
+  bool        prefer_closest_h_;
 };
 
 int main(int argc, char ** argv)

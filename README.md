@@ -140,6 +140,12 @@ ros2 run drone_control pouso --ros-args \
   -p y:=-2.0
 ```
 
+**Land on the YOLO-detected H marker closest to being directly under the drone:**
+```bash
+ros2 run drone_control pouso --ros-args \
+  -p use_yolo_h:=true
+```
+
 **Full parameter set:**
 ```bash
 ros2 run drone_control pouso --ros-args \
@@ -164,6 +170,11 @@ ros2 run drone_control pouso --ros-args \
 | `frame_id` | `map` | Coordinate frame for the published `PoseArray` |
 | `check_after_sec` | `15.0` | Timeout (s) before the node shuts down if landing is not confirmed |
 | `rate_hz` | `10.0` | Timer rate (Hz) |
+| `use_yolo_h` | `false` | Use the YOLO-detected H marker as landing target |
+| `h_topic` | `/landing_pad/h_relative_position` | Topic for YOLO H detections (`geometry_msgs/PointStamped`, `point.x=right`, `point.y=front`) |
+| `h_timeout_s` | `0.75` | Max age (s) of a valid H detection; older detections are ignored and the node falls back |
+| `max_h_range_m` | `6.0` | Reject H detections with planar range > this value (m) |
+| `prefer_closest_h` | `true` | Among recent detections pick the one with minimum range; `false` picks the latest |
 
 ### Topics
 
