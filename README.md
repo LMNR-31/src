@@ -147,6 +147,14 @@ ros2 run drone_control pouso --ros-args \
   -p h_collect_time_s:=1.0
 ```
 
+**Land with strict 5 cm XY centering precision (YOLO H + XY tolerance):**
+```bash
+ros2 run drone_control pouso --ros-args \
+  -p use_yolo_h:=true \
+  -p h_collect_time_s:=1.0 \
+  -p xy_hold_tol:=0.05
+```
+
 **Full parameter set:**
 ```bash
 ros2 run drone_control pouso --ros-args \
@@ -171,6 +179,7 @@ ros2 run drone_control pouso --ros-args \
 | `frame_id` | `map` | Coordinate frame for the published `PoseArray` |
 | `check_after_sec` | `15.0` | Timeout (s) before the node shuts down if landing is not confirmed |
 | `rate_hz` | `10.0` | Timer rate (Hz) |
+| `xy_hold_tol` | `0.05` | Max planar distance (m) from the landing target allowed for completion; if the drone drifts beyond this during descent the approach+land waypoints are reissued to pull it back |
 | `use_yolo_h` | `false` | Use the YOLO-detected H marker as landing target |
 | `h_topic` | `/landing_pad/h_relative_position` | Topic for YOLO H detections (`geometry_msgs/PointStamped`, `point.x=right`, `point.y=front`) |
 | `h_collect_time_s` | `1.0` | Seconds to hover and collect H detections before choosing the best (closest to under the drone) |
