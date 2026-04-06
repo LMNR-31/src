@@ -174,7 +174,7 @@ class PadWaypointSupervisor(Node):
         self._last_accepted_front: float = 0.0
 
         # Lost-recovery state
-        self._last_valid_candidate_t: float = time.time()
+        self._last_valid_candidate_t: float = time.monotonic()
         self._yaw_scan_active: bool = False
         self._yaw_scan_proc: Optional[subprocess.Popen[bytes]] = None
         self._last_yaw_scan_t: float = 0.0
@@ -436,18 +436,18 @@ class PadWaypointSupervisor(Node):
                 c.last_seen_s = now
                 c.seen_count += 1
                 # Track when we last had a detection that contributes to a candidate
-                self._last_valid_candidate_t = now
+                self._last_valid_candidate_t = time.monotonic()
                 return
 
         # New candidate
         self.candidates.append(BaseCandidate(x=bx, y=by, last_seen_s=now, seen_count=1))
-        self._last_valid_candidate_t = now
+        self._last_valid_candidate_t = time.monotonic()
 
     def _try_yaw_scan_recovery(self):
         """Trigger a non-blocking yaw-360 recovery scan if not already scanning."""
         if self._yaw_scan_active:
             return
-        now = time.time()
+        now = time.monotonic()
         if now - self._last_yaw_scan_t < self.yaw_scan_cooldown_s:
             return
         self.get_logger().warning(
@@ -630,14 +630,14 @@ class PadWaypointSupervisor(Node):
                         f"[LOST] drone_yaw_360 exited with code {ret}."
                     )
                 # Reset lost timer so we don't immediately re-trigger
-                self._last_valid_candidate_t = time.time()
+                self._last_valid_candidate_t = time.monotonic()
 
         # Update lost-timer whenever a confirmed candidate exists
         confirmed_any = any(
             c.seen_count >= self.min_seen_count for c in self.candidates
         )
         if confirmed_any:
-            self._last_valid_candidate_t = time.time()
+            self._last_valid_candidate_t = time.monotonic()
 
         # State machine
         if self.state == "SCAN":
@@ -689,7 +689,7 @@ class PadWaypointSupervisor(Node):
                     return
                 # No valid target yet — check for "lost" condition and trigger yaw recovery
                 if not confirmed:
-                    elapsed_lost = time.time() - self._last_valid_candidate_t
+                    elapsed_lost = time.monotonic() - self._last_valid_candidate_t
                     if elapsed_lost > self.lost_timeout_s:
                         self._try_yaw_scan_recovery()
                 # Still discovering bases (or waiting for more detections)
