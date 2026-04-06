@@ -5,19 +5,20 @@
 // then descends to ground level.
 //
 // Parameters
-//   uav_name        (string, default "uav1")    — UAV namespace prefix
-//   x               (double, default  0.0)      — target landing X (ENU, m)
-//   y               (double, default  0.0)      — target landing Y (ENU, m)
-//   use_current_xy  (bool,   default  true)     — ignore x/y and use live odom XY
-//   landing_z       (double, default  0.05)     — final ground altitude (m)
-//   frame_id        (string, default "map")     — coordinate frame
-//   rate_hz         (double, default  10.0)     — timer rate (Hz)
-//   check_after_sec (double, default  15.0)     — seconds before giving up
-//   use_yolo_h      (bool,   default  false)    — use YOLO H detection for landing XY
-//   h_topic         (string, default "/landing_pad/h_relative_position") — YOLO H topic
-//   h_timeout_s     (double, default  0.75)     — max age (s) of a valid H detection
-//   max_h_range_m   (double, default  6.0)      — max planar range (m) to accept a detection
-//   prefer_closest_h (bool,  default  true)     — pick H closest to drone; false = latest
+//   uav_name         (string, default "uav1")    — UAV namespace prefix
+//   x                (double, default  0.0)      — target landing X (ENU, m)
+//   y                (double, default  0.0)      — target landing Y (ENU, m)
+//   use_current_xy   (bool,   default  true)     — ignore x/y and use live odom XY
+//   landing_z        (double, default  0.05)     — final ground altitude (m)
+//   frame_id         (string, default "map")     — coordinate frame
+//   rate_hz          (double, default  10.0)     — timer rate (Hz)
+//   check_after_sec  (double, default  15.0)     — seconds before giving up
+//   use_yolo_h       (bool,   default  false)    — use YOLO H detection for landing XY
+//   h_topic          (string, default "/landing_pad/h_relative_position") — YOLO H topic
+//   h_collect_time_s (double, default  1.0)      — seconds to hover and collect H detections (COLLECT_H state) before choosing best
+//   h_timeout_s      (double, default  0.75)     — max age (s) of a valid H detection (rolling window)
+//   max_h_range_m    (double, default  6.0)      — max planar range (m) to accept a detection
+//   prefer_closest_h (bool,   default  true)     — pick H closest to drone; false = latest
 //
 // Published topics
 //   /waypoints  [geometry_msgs/PoseArray]   — consumed by my_drone_controller
@@ -37,14 +38,14 @@
 using namespace std::chrono_literals;
 using std::placeholders::_1;
 
-enum class PousoFSM { WAIT_FCU, WAIT_ODOM, PUBLISH, MONITOR };
+enum class PousoFSM { WAIT_FCU, WAIT_ODOM, COLLECT_H, PUBLISH, MONITOR };
 
 struct HDetection
 {
   rclcpp::Time stamp;
-  double right;
-  double front;
-  double range;
+  double right {0.0};
+  double front {0.0};
+  double range {0.0};
 };
 
 class PousoNode : public rclcpp::Node
@@ -66,6 +67,7 @@ public:
     this->declare_parameter<double>     ("check_after_sec", 15.0);
     this->declare_parameter<bool>       ("use_yolo_h",      false);
     this->declare_parameter<std::string>("h_topic",         "/landing_pad/h_relative_position");
+    this->declare_parameter<double>     ("h_collect_time_s", 1.0);
     this->declare_parameter<double>     ("h_timeout_s",     0.75);
     this->declare_parameter<double>     ("max_h_range_m",   6.0);
     this->declare_parameter<bool>       ("prefer_closest_h", true);
@@ -80,6 +82,7 @@ public:
     double rate_hz   = this->get_parameter("rate_hz").as_double();
     use_yolo_h_      = this->get_parameter("use_yolo_h").as_bool();
     h_topic_         = this->get_parameter("h_topic").as_string();
+    h_collect_time_s_ = this->get_parameter("h_collect_time_s").as_double();
     h_timeout_s_     = this->get_parameter("h_timeout_s").as_double();
     max_h_range_m_   = this->get_parameter("max_h_range_m").as_double();
     prefer_closest_h_ = this->get_parameter("prefer_closest_h").as_bool();
@@ -152,6 +155,15 @@ private:
       return;
     }
 
+    // During collection window, track the best (closest) candidate
+    if (fsm_ == PousoFSM::COLLECT_H) {
+      h_collect_count_++;
+      if (!has_best_h_ || range < best_collected_h_.range) {
+        best_collected_h_ = {this->now(), right, front, range};
+        has_best_h_ = true;
+      }
+    }
+
     h_detections_.push_back({this->now(), right, front, range});
 
     // Prune detections older than h_timeout_s_
@@ -190,8 +202,44 @@ private:
         RCLCPP_INFO(this->get_logger(),
           "Odometria recebida. Posição atual: X=%.2f Y=%.2f Z=%.2f",
           current_x_, current_y_, current_z_);
-        fsm_ = PousoFSM::PUBLISH;
+        if (use_yolo_h_) {
+          RCLCPP_INFO(this->get_logger(),
+            "[yolo_h] Iniciando coleta de detecções H por %.1fs…",
+            h_collect_time_s_);
+          collect_start_    = this->now();
+          h_collect_count_  = 0;
+          has_best_h_       = false;
+          fsm_ = PousoFSM::COLLECT_H;
+        } else {
+          fsm_ = PousoFSM::PUBLISH;
+        }
         break;
+
+      case PousoFSM::COLLECT_H:
+        {
+          double elapsed = (this->now() - collect_start_).seconds();
+          if (elapsed < h_collect_time_s_) {
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+              "[yolo_h] Coletando H… %.1f/%.1fs (%d detecções aceitas)",
+              elapsed, h_collect_time_s_, h_collect_count_);
+            return;
+          }
+          // Collection window elapsed
+          if (has_best_h_) {
+            RCLCPP_INFO(this->get_logger(),
+              "[yolo_h] Coleta concluída (%.1fs): %d detecções aceitas, "
+              "melhor range=%.2fm (right=%.2f front=%.2f)",
+              h_collect_time_s_, h_collect_count_,
+              best_collected_h_.range, best_collected_h_.right, best_collected_h_.front);
+          } else {
+            RCLCPP_WARN(this->get_logger(),
+              "[yolo_h] Coleta concluída (%.1fs): NENHUMA detecção H válida. "
+              "Usando fallback (odometria/parâmetros).",
+              h_collect_time_s_);
+          }
+          fsm_ = PousoFSM::PUBLISH;
+          break;
+        }
 
       case PousoFSM::PUBLISH:
         callAutoLand();
@@ -240,39 +288,22 @@ private:
     bool used_yolo_h = false;
 
     if (use_yolo_h_) {
-      // Find best H detection among those within h_timeout_s_
-      rclcpp::Time now = this->now();
-      const HDetection * best = nullptr;
-      for (const auto & d : h_detections_) {
-        if ((now - d.stamp).seconds() > h_timeout_s_) {
-          continue;
-        }
-        if (best == nullptr) {
-          best = &d;
-          continue;
-        }
-        if (prefer_closest_h_) {
-          if (d.range < best->range) {best = &d;}
-        } else {
-          if (d.stamp > best->stamp) {best = &d;}
-        }
-      }
-
-      if (best != nullptr) {
+      if (has_best_h_) {
         double yaw = current_yaw_;
-        double dx  = std::cos(yaw) * best->front + std::sin(yaw) * best->right;
-        double dy  = std::sin(yaw) * best->front - std::cos(yaw) * best->right;
+        double dx  = std::cos(yaw) * best_collected_h_.front + std::sin(yaw) * best_collected_h_.right;
+        double dy  = std::sin(yaw) * best_collected_h_.front - std::cos(yaw) * best_collected_h_.right;
         land_x = current_x_ + dx;
         land_y = current_y_ + dy;
         used_yolo_h = true;
         RCLCPP_INFO(this->get_logger(),
           "[yolo_h] Alvo YOLO-H: XY=(%.2f, %.2f) | right=%.2f front=%.2f "
           "range=%.2f yaw=%.3frad",
-          land_x, land_y, best->right, best->front, best->range, yaw);
+          land_x, land_y, best_collected_h_.right, best_collected_h_.front,
+          best_collected_h_.range, yaw);
       } else {
         RCLCPP_WARN(this->get_logger(),
-          "[yolo_h] Nenhuma detecção H válida nos últimos %.2fs. "
-          "Usando fallback (odometria/parâmetros).", h_timeout_s_);
+          "[yolo_h] Nenhuma detecção H válida coletada. "
+          "Usando fallback (odometria/parâmetros).");
         land_x = use_current_xy_ ? current_x_ : target_x_;
         land_y = use_current_xy_ ? current_y_ : target_y_;
       }
@@ -362,6 +393,10 @@ private:
   std::vector<HDetection> h_detections_;
 
   rclcpp::Time attempt_start_;
+  rclcpp::Time collect_start_;
+  int          h_collect_count_ {0};
+  bool         has_best_h_      {false};
+  HDetection   best_collected_h_;
 
   // Parameters
   std::string uav_name_;
@@ -373,6 +408,7 @@ private:
   double      check_after_sec_;
   bool        use_yolo_h_;
   std::string h_topic_;
+  double      h_collect_time_s_;
   double      h_timeout_s_;
   double      max_h_range_m_;
   bool        prefer_closest_h_;
