@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+import subprocess
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -72,6 +73,20 @@ class PadWaypointSupervisor(Node):
         self.declare_parameter("h_timeout_s", 3.0)          # discard H position if older than this
         self.declare_parameter("max_h_base_separation_m", 0.5)  # discard H if H_rel vs base_rel distance exceeds this
 
+        # Axis correction: flip the incoming right (x) axis to fix systematic lateral bias
+        self.declare_parameter("invert_right_axis", True)
+        # Fine-tuning offsets applied in base_link before world projection
+        self.declare_parameter("target_offset_right_m", 0.0)
+        self.declare_parameter("target_offset_front_m", 0.0)
+
+        # Outlier rejection
+        self.declare_parameter("max_detection_range_m", 3.0)  # discard if farther than this
+        self.declare_parameter("max_jump_m", 0.8)  # discard if jump from last accepted > this
+
+        # "Lost" recovery: trigger yaw-360 scan if no valid candidate for this long
+        self.declare_parameter("lost_timeout_s", 10.0)
+        self.declare_parameter("yaw_scan_cooldown_s", 30.0)
+
         self.odom_topic = self.get_parameter("odom_topic").value
         self.base_det_topic = self.get_parameter("base_det_topic").value
         self.front_det_topic = self.get_parameter("front_det_topic").value
@@ -103,6 +118,14 @@ class PadWaypointSupervisor(Node):
         self.h_det_topic = self.get_parameter("h_det_topic").value
         self.h_timeout_s = float(self.get_parameter("h_timeout_s").value)
         self.max_h_base_separation_m = float(self.get_parameter("max_h_base_separation_m").value)
+
+        self.invert_right_axis = bool(self.get_parameter("invert_right_axis").value)
+        self.target_offset_right_m = float(self.get_parameter("target_offset_right_m").value)
+        self.target_offset_front_m = float(self.get_parameter("target_offset_front_m").value)
+        self.max_detection_range_m = float(self.get_parameter("max_detection_range_m").value)
+        self.max_jump_m = float(self.get_parameter("max_jump_m").value)
+        self.lost_timeout_s = float(self.get_parameter("lost_timeout_s").value)
+        self.yaw_scan_cooldown_s = float(self.get_parameter("yaw_scan_cooldown_s").value)
 
         # State
         self.have_odom = False
@@ -144,6 +167,17 @@ class PadWaypointSupervisor(Node):
         self._base_right: float = 0.0
         self._base_front: float = 0.0
         self._base_last_t: float = 0.0  # monotonic time of last base detection
+
+        # Last accepted detection position (body frame, after inversion/offsets) for jump filtering
+        self._have_last_accepted: bool = False
+        self._last_accepted_right: float = 0.0
+        self._last_accepted_front: float = 0.0
+
+        # Lost-recovery state
+        self._last_valid_candidate_t: float = time.time()
+        self._yaw_scan_active: bool = False
+        self._yaw_scan_proc: Optional[subprocess.Popen] = None  # type: ignore[type-arg]
+        self._last_yaw_scan_t: float = 0.0
 
         # ROS I/O
         self.sub_odom = self.create_subscription(Odometry, self.odom_topic, self.cb_odom, 10)
@@ -197,7 +231,14 @@ class PadWaypointSupervisor(Node):
             f" world_frame_id={self.world_frame_id} (NOTE: treated numerically as the odom frame)\n"
             f" z_fixed={self.z_fixed}\n"
             f" bases_to_visit={self.bases_to_visit}\n"
-            f" cluster_tol_m={self.cluster_tol_m} min_seen_count={self.min_seen_count}"
+            f" cluster_tol_m={self.cluster_tol_m} min_seen_count={self.min_seen_count}\n"
+            f" invert_right_axis={self.invert_right_axis} "
+            f"target_offset_right_m={self.target_offset_right_m} "
+            f"target_offset_front_m={self.target_offset_front_m}\n"
+            f" max_detection_range_m={self.max_detection_range_m} "
+            f"max_jump_m={self.max_jump_m}\n"
+            f" lost_timeout_s={self.lost_timeout_s} "
+            f"yaw_scan_cooldown_s={self.yaw_scan_cooldown_s}"
         )
 
     def cb_finished(self, msg: Bool):
@@ -252,8 +293,14 @@ class PadWaypointSupervisor(Node):
 
     def cb_h_det(self, msg: PointStamped):
         """Store the latest H-marker relative position (right=x, front=y in base_link)."""
-        self._h_right = float(msg.point.x)
-        self._h_front = float(msg.point.y)
+        right = float(msg.point.x)
+        front = float(msg.point.y)
+        if self.invert_right_axis:
+            right = -right
+        right += self.target_offset_right_m
+        front += self.target_offset_front_m
+        self._h_right = right
+        self._h_front = front
         self._h_last_t = time.monotonic()
 
     def cb_det(self, msg: PointStamped, source: str):
@@ -294,6 +341,50 @@ class PadWaypointSupervisor(Node):
 
         right = float(msg.point.x)
         front = float(msg.point.y)
+
+        # Axis inversion: flip right (x) sign to correct systematic lateral bias
+        if self.invert_right_axis:
+            right = -right
+            self.get_logger().debug(
+                f"[{source}] invert_right_axis: x flipped to {right:.3f}"
+            )
+
+        # Fine-tuning offsets (applied in base_link before world projection)
+        if self.target_offset_right_m != 0.0 or self.target_offset_front_m != 0.0:
+            right += self.target_offset_right_m
+            front += self.target_offset_front_m
+            self.get_logger().debug(
+                f"[{source}] offsets applied: right={right:.3f} front={front:.3f}"
+            )
+
+        # Outlier rejection: range check
+        det_range = math.hypot(right, front)
+        if det_range > self.max_detection_range_m:
+            self.get_logger().warning(
+                f"[{source}] Detection discarded: range={det_range:.2f}m > "
+                f"max_detection_range_m={self.max_detection_range_m}m "
+                f"(right={right:.2f} front={front:.2f})"
+            )
+            return
+
+        # Outlier rejection: jump check from last accepted detection
+        if self._have_last_accepted:
+            jump = math.hypot(
+                right - self._last_accepted_right,
+                front - self._last_accepted_front,
+            )
+            if jump > self.max_jump_m:
+                self.get_logger().warning(
+                    f"[{source}] Detection discarded: jump={jump:.2f}m > "
+                    f"max_jump_m={self.max_jump_m}m "
+                    f"(right={right:.2f} front={front:.2f})"
+                )
+                return
+
+        # Detection accepted — update last accepted position
+        self._have_last_accepted = True
+        self._last_accepted_right = right
+        self._last_accepted_front = front
 
         # Store latest base relative position for H gating
         self._base_right = right
@@ -344,10 +435,56 @@ class PadWaypointSupervisor(Node):
                 c.y = (1 - alpha) * c.y + alpha * by
                 c.last_seen_s = now
                 c.seen_count += 1
+                # Track when we last had a detection that contributes to a candidate
+                self._last_valid_candidate_t = now
                 return
 
         # New candidate
         self.candidates.append(BaseCandidate(x=bx, y=by, last_seen_s=now, seen_count=1))
+        self._last_valid_candidate_t = now
+
+    def _try_yaw_scan_recovery(self):
+        """Trigger a non-blocking yaw-360 recovery scan if not already scanning."""
+        now = time.time()
+        # Poll existing subprocess first
+        if self._yaw_scan_active and self._yaw_scan_proc is not None:
+            ret = self._yaw_scan_proc.poll()
+            if ret is not None:
+                self._yaw_scan_active = False
+                self._yaw_scan_proc = None
+                if ret == 0:
+                    self.get_logger().info("[LOST] drone_yaw_360 completed successfully.")
+                else:
+                    self.get_logger().warning(
+                        f"[LOST] drone_yaw_360 exited with code {ret}."
+                    )
+            else:
+                # Still running
+                return
+        if self._yaw_scan_active:
+            return
+        if now - self._last_yaw_scan_t < self.yaw_scan_cooldown_s:
+            return
+        self.get_logger().warning(
+            "[LOST] No valid base candidate found for "
+            f"{self.lost_timeout_s:.1f}s — triggering yaw-360 recovery scan."
+        )
+        try:
+            proc = subprocess.Popen(
+                ["ros2", "run", "drone_control", "drone_yaw_360"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self._yaw_scan_active = True
+            self._yaw_scan_proc = proc
+            self._last_yaw_scan_t = now
+            self.get_logger().info(
+                f"[LOST] drone_yaw_360 launched (pid={proc.pid})."
+            )
+        except Exception as exc:
+            self.get_logger().error(
+                f"[LOST] Failed to launch drone_yaw_360: {exc}"
+            )
 
     def _pick_next_target(self) -> Optional[Tuple[float, float]]:
         # Debug: log full candidate list each time we pick
@@ -495,6 +632,28 @@ class PadWaypointSupervisor(Node):
         if not self.have_odom:
             return
 
+        # Poll the yaw-scan subprocess to detect completion
+        if self._yaw_scan_active and self._yaw_scan_proc is not None:
+            ret = self._yaw_scan_proc.poll()
+            if ret is not None:
+                self._yaw_scan_active = False
+                self._yaw_scan_proc = None
+                if ret == 0:
+                    self.get_logger().info("[LOST] drone_yaw_360 completed successfully.")
+                else:
+                    self.get_logger().warning(
+                        f"[LOST] drone_yaw_360 exited with code {ret}."
+                    )
+                # Reset lost timer so we don't immediately re-trigger
+                self._last_valid_candidate_t = time.time()
+
+        # Update lost-timer whenever a confirmed candidate exists
+        confirmed_any = any(
+            c.seen_count >= self.min_seen_count for c in self.candidates
+        )
+        if confirmed_any:
+            self._last_valid_candidate_t = time.time()
+
         # State machine
         if self.state == "SCAN":
             # Collect detections passively while supervisor_T runs the yaw scan.
@@ -542,6 +701,12 @@ class PadWaypointSupervisor(Node):
                     )
                     self.state = "RETURN_HOME"
                     self.active_target = (self.home_x, self.home_y)
+                    return
+                # No valid target yet — check for "lost" condition and trigger yaw recovery
+                if not confirmed:
+                    elapsed_lost = time.time() - self._last_valid_candidate_t
+                    if elapsed_lost > self.lost_timeout_s:
+                        self._try_yaw_scan_recovery()
                 # Still discovering bases (or waiting for more detections)
                 return
 
