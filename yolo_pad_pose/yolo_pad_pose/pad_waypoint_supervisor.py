@@ -7,10 +7,9 @@ from typing import List, Optional, Tuple
 import rclpy
 from rclpy.node import Node
 
-from drone_control.msg import YawOverride
 from geometry_msgs.msg import Pose, PoseArray, PointStamped
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Bool, Int32
+from std_msgs.msg import Int32
 
 
 def yaw_from_quat(x: float, y: float, z: float, w: float) -> float:
@@ -31,89 +30,46 @@ class BaseCandidate:
 
 class PadWaypointSupervisor(Node):
     """
-    Subscribes to YOLO detections from front+down cameras (optical frame points),
-    converts to right/front, projects to map using odom yaw, deduplicates bases,
-    and publishes /waypoints (PoseArray) with 2 poses: current + target (z fixed).
+    Simplified pad waypoint supervisor.
+
+    Builds a deduplicated list of landing bases from YOLO detections
+    (/landing_pad/base_relative_position), confirms candidates by
+    min_seen_count, visits up to bases_to_visit bases in nearest-neighbour
+    order, and returns home (first odom position) after all bases are visited.
+
+    Waypoints (/waypoints, PoseArray with 2 poses: current + target) are
+    published only when state_voo == 2.  A configurable pause
+    (inter_base_wait_s, default 5 s) is observed between consecutive bases;
+    during this pause the node stays quiet (no waypoint publishes) but
+    continues accumulating detections.
+
+    FSM states: COLLECT → NAVIGATE → WAIT_BETWEEN_BASES → RETURN_HOME → DONE
     """
 
     def __init__(self):
         super().__init__("pad_waypoint_supervisor")
 
-        # Parameters
+        # ── Parameters ───────────────────────────────────────────────────────
         self.declare_parameter("odom_topic", "/uav1/mavros/local_position/odom")
         self.declare_parameter("base_det_topic", "/landing_pad/base_relative_position")
-        # Legacy per-camera optical-frame topics; set to "" to disable
-        self.declare_parameter("front_det_topic", "")
-        self.declare_parameter("down_det_topic", "")
         self.declare_parameter("waypoints_topic", "/waypoints")
-
-        self.declare_parameter("trajectory_finished_topic", "/trajectory_finished")
-        self.declare_parameter("use_trajectory_finished", True)
-        self.declare_parameter("mission_cycle_done_topic", "/mission_cycle_done")
-        self.declare_parameter("use_mission_cycle_done", True)
-        self.declare_parameter("mission_cycle_timeout_s", 0.0)  # <=0 = disabled; >0 forces progress after this many seconds
-        self.declare_parameter("yaw_scan_done_topic", "/yaw_scan_done")
-        self.declare_parameter("scan_duration_s", 35.0)   # fallback: auto-advance SCAN after this many seconds
         self.declare_parameter("controller_state_topic", "/drone_controller/state_voo")
 
-        self.declare_parameter("world_frame_id", "map")  # output PoseArray header frame_id; treated numerically as odom
+        self.declare_parameter("world_frame_id", "map")
         self.declare_parameter("z_fixed", 1.5)
         self.declare_parameter("bases_to_visit", 6)
 
-        self.declare_parameter("cluster_tol_m", 0.5)        # merge detections within this radius
-        self.declare_parameter("min_seen_count", 6)         # require stable detection before accepting a base
-        self.declare_parameter("candidate_timeout_s", 30.0) # drop candidates not seen recently
+        self.declare_parameter("cluster_tol_m", 0.8)    # merge detections within this radius
+        self.declare_parameter("min_seen_count", 5)      # confirmations before accepting a base
 
-        self.declare_parameter("publish_period_s", 0.25)    # how often to republish target while navigating
-        self.declare_parameter("reach_tol_m", 0.1)           # consider reached when within this XY distance
-        self.declare_parameter("home_x", 0.0)
-        self.declare_parameter("home_y", 0.0)
-        self.declare_parameter("repeat_block_m", 1.2)       # skip targets within this radius of any visited position
-        self.declare_parameter("aim_at_home", False)        # orient waypoints to face toward home
-        self.declare_parameter("aim_at_h", True)            # orient waypoints to face toward detected H marker
-        self.declare_parameter("h_det_topic", "/landing_pad/h_relative_position")
-        self.declare_parameter("h_timeout_s", 3.0)          # discard H position if older than this
-        self.declare_parameter("max_h_base_separation_m", 0.5)  # discard H if H_rel vs base_rel distance exceeds this
+        self.declare_parameter("publish_period_s", 0.25)  # waypoint re-publish interval (s)
+        self.declare_parameter("reach_tol_m", 0.15)       # XY distance to consider "reached"
+        self.declare_parameter("inter_base_wait_s", 5.0)  # pause between consecutive bases (s)
 
-        # Axis correction flags — allow runtime sign flips without code changes.
-        # Detection convention: msg.point.x = right, msg.point.y = front (in uav1/base_link).
-        # The projection formula already handles this convention correctly, so all flags
-        # default to False.  Set invert_right_axis=True only if your detector publishes
-        # x=left; set invert_front_axis=True if it publishes y=back; set invert_yaw=True
-        # if the odom yaw sign appears inverted relative to the world frame.
-        self.declare_parameter("invert_right_axis", False)
-        self.declare_parameter("invert_front_axis", False)
-        self.declare_parameter("invert_yaw", False)
-        # Fine-tuning offsets applied in base_link before world projection
-        self.declare_parameter("target_offset_right_m", 0.0)
-        self.declare_parameter("target_offset_front_m", 0.0)
-
-        # Outlier rejection
-        self.declare_parameter("max_detection_range_m", 3.0)  # discard if farther than this
-        self.declare_parameter("max_jump_m", 0.8)  # discard if jump from last accepted > this
-
-        # "Lost" recovery: trigger yaw-360 scan if no valid candidate for this long
-        self.declare_parameter("lost_timeout_s", 10.0)
-        self.declare_parameter("yaw_scan_cooldown_s", 30.0)
-        # In-node yaw-override scan parameters
-        self.declare_parameter("yaw_override_topic", "/uav1/yaw_override/cmd")
-        self.declare_parameter("yaw_scan_rate_rad_s", 0.6)
-        self.declare_parameter("yaw_scan_publish_hz", 10.0)
-        self.declare_parameter("yaw_scan_duration_s", 0.0)  # 0 = auto: 2π/rate
-
+        # ── Read parameters ───────────────────────────────────────────────────
         self.odom_topic = self.get_parameter("odom_topic").value
         self.base_det_topic = self.get_parameter("base_det_topic").value
-        self.front_det_topic = self.get_parameter("front_det_topic").value
-        self.down_det_topic = self.get_parameter("down_det_topic").value
         self.waypoints_topic = self.get_parameter("waypoints_topic").value
-
-        self.trajectory_finished_topic = self.get_parameter("trajectory_finished_topic").value
-        self.use_trajectory_finished = bool(self.get_parameter("use_trajectory_finished").value)
-        self.mission_cycle_done_topic = self.get_parameter("mission_cycle_done_topic").value
-        self.use_mission_cycle_done = bool(self.get_parameter("use_mission_cycle_done").value)
-        self.mission_cycle_timeout_s = float(self.get_parameter("mission_cycle_timeout_s").value)
-        self.yaw_scan_done_topic = self.get_parameter("yaw_scan_done_topic").value
-        self.scan_duration_s = float(self.get_parameter("scan_duration_s").value)
         self.controller_state_topic = self.get_parameter("controller_state_topic").value
 
         self.world_frame_id = self.get_parameter("world_frame_id").value
@@ -122,115 +78,38 @@ class PadWaypointSupervisor(Node):
 
         self.cluster_tol_m = float(self.get_parameter("cluster_tol_m").value)
         self.min_seen_count = int(self.get_parameter("min_seen_count").value)
-        self.candidate_timeout_s = float(self.get_parameter("candidate_timeout_s").value)
 
         self.publish_period_s = float(self.get_parameter("publish_period_s").value)
         self.reach_tol_m = float(self.get_parameter("reach_tol_m").value)
-        self.home_x = float(self.get_parameter("home_x").value)
-        self.home_y = float(self.get_parameter("home_y").value)
-        self.repeat_block_m = float(self.get_parameter("repeat_block_m").value)
-        self.aim_at_home = bool(self.get_parameter("aim_at_home").value)
-        self.aim_at_h = bool(self.get_parameter("aim_at_h").value)
-        self.h_det_topic = self.get_parameter("h_det_topic").value
-        self.h_timeout_s = float(self.get_parameter("h_timeout_s").value)
-        self.max_h_base_separation_m = float(self.get_parameter("max_h_base_separation_m").value)
+        self.inter_base_wait_s = float(self.get_parameter("inter_base_wait_s").value)
 
-        self.invert_right_axis = bool(self.get_parameter("invert_right_axis").value)
-        self.invert_front_axis = bool(self.get_parameter("invert_front_axis").value)
-        self.invert_yaw = bool(self.get_parameter("invert_yaw").value)
-        self.target_offset_right_m = float(self.get_parameter("target_offset_right_m").value)
-        self.target_offset_front_m = float(self.get_parameter("target_offset_front_m").value)
-        self.max_detection_range_m = float(self.get_parameter("max_detection_range_m").value)
-        self.max_jump_m = float(self.get_parameter("max_jump_m").value)
-        self.lost_timeout_s = float(self.get_parameter("lost_timeout_s").value)
-        self.yaw_scan_cooldown_s = float(self.get_parameter("yaw_scan_cooldown_s").value)
-        self.yaw_override_topic = self.get_parameter("yaw_override_topic").value
-        self.yaw_scan_rate_rad_s = float(self.get_parameter("yaw_scan_rate_rad_s").value)
-        self.yaw_scan_publish_hz = float(self.get_parameter("yaw_scan_publish_hz").value)
-        _yaw_scan_dur_param = float(self.get_parameter("yaw_scan_duration_s").value)
-        self._yaw_scan_dur_eff = (
-            _yaw_scan_dur_param if _yaw_scan_dur_param > 0.0
-            else (2.0 * math.pi / max(self.yaw_scan_rate_rad_s, 0.01))
-        )
+        # ── Runtime state ─────────────────────────────────────────────────────
+        self.have_odom: bool = False
+        self.cur_x: float = 0.0
+        self.cur_y: float = 0.0
+        self.cur_yaw: float = 0.0
 
-        # State
-        self.have_odom = False
-        self.cur_x = 0.0
-        self.cur_y = 0.0
-        self.cur_yaw = 0.0
+        self.home_x: float = 0.0
+        self.home_y: float = 0.0
+        self._have_home: bool = False
 
-        self.trajectory_finished = False
-        self._last_finished_msg_t = 0.0
-        self.mission_cycle_done = False
-        self._wait_mission_start_t: float = 0.0  # time we entered WAIT_MISSION_DONE
-        self.yaw_scan_done = False
-        self._scan_start_t = time.time()
-        self.ready_for_commands = (not self.use_trajectory_finished)
-        if self.ready_for_commands:
-            self.get_logger().info("[READY] use_trajectory_finished=False, enabling waypoint publishing immediately.")
-        else:
-            self.get_logger().info("[WAIT] use_trajectory_finished=True, waiting for /trajectory_finished to enable waypoint publishing.")
-        self.state_voo = None           # controller state from /drone_controller/state_voo
-        self._last_state_warn_t = 0.0   # for throttled warning when state not in (2,3)
-        self._last_zero_stamp_warn_t = 0.0  # for throttled warning on zero-stamp messages
+        self.state_voo: Optional[int] = None
 
         self.candidates: List[BaseCandidate] = []
         self.active_target: Optional[Tuple[float, float]] = None
-        self.visited_count = 0
-        self.visited_positions: List[Tuple[float, float]] = []
-        self.state = "SCAN"   # SCAN -> DISCOVER -> NAVIGATE -> WAIT_MISSION_DONE -> ... -> RETURN_HOME -> DONE
+        self.visited_count: int = 0
 
-        # Home captured from the first odom reading (used for aim_at_home)
-        self._have_home_from_odom = False
-        self._home_from_odom_x = 0.0
-        self._home_from_odom_y = 0.0
+        # FSM: COLLECT → NAVIGATE → WAIT_BETWEEN_BASES → RETURN_HOME → DONE
+        self.state: str = "COLLECT"
+        self._wait_start_t: float = 0.0   # monotonic time when WAIT_BETWEEN_BASES started
 
-        # Latest H-marker position received in base_link frame (right, front) + timestamp
-        self._h_right: float = 0.0
-        self._h_front: float = 0.0
-        self._h_last_t: float = 0.0   # monotonic time of last H detection
+        self._last_det_info_t: float = 0.0   # throttle detection log to 1 Hz
 
-        # Latest base detection in base_link frame (right, front) used for H gating
-        self._base_right: float = 0.0
-        self._base_front: float = 0.0
-        self._base_last_t: float = 0.0  # monotonic time of last base detection
-
-        # Last accepted detection position (body frame, after inversion/offsets) for jump filtering
-        self._have_last_accepted: bool = False
-        self._last_accepted_right: float = 0.0
-        self._last_accepted_front: float = 0.0
-
-        # Lost-recovery state
-        self._last_valid_candidate_t: float = time.monotonic()
-        self._yaw_scan_active: bool = False
-        self._yaw_scan_start_t: float = 0.0
-        self._last_yaw_scan_t: float = 0.0
-
-        # ROS I/O
-        self.sub_odom = self.create_subscription(Odometry, self.odom_topic, self.cb_odom, 10)
+        # ── ROS I/O ───────────────────────────────────────────────────────────
+        self.sub_odom = self.create_subscription(
+            Odometry, self.odom_topic, self.cb_odom, 10)
         self.sub_base = self.create_subscription(
-            PointStamped, self.base_det_topic, lambda m: self.cb_det(m, "base"), 10)
-        # Legacy per-camera optical-frame topics (only subscribed if topic is non-empty)
-        if self.front_det_topic:
-            self.sub_front = self.create_subscription(
-                PointStamped, self.front_det_topic, lambda m: self.cb_det(m, "front"), 10)
-        if self.down_det_topic:
-            self.sub_down = self.create_subscription(
-                PointStamped, self.down_det_topic, lambda m: self.cb_det(m, "down"), 10)
-        self.sub_h_det = self.create_subscription(
-            PointStamped, self.h_det_topic, self.cb_h_det, 10)
-
-        if self.use_trajectory_finished:
-            self.sub_finished = self.create_subscription(Bool, self.trajectory_finished_topic, self.cb_finished, 10)
-        else:
-            self.sub_finished = None
-
-        self.sub_mission_cycle_done = self.create_subscription(
-            Bool, self.mission_cycle_done_topic, self.cb_mission_cycle_done, 10)
-
-        self.sub_yaw_scan_done = self.create_subscription(
-            Bool, self.yaw_scan_done_topic, self.cb_yaw_scan_done, 10)
-
+            PointStamped, self.base_det_topic, self.cb_det, 10)
         self.sub_state_voo = self.create_subscription(
             Int32, self.controller_state_topic, self.cb_state_voo,
             rclpy.qos.QoSProfile(
@@ -241,90 +120,22 @@ class PadWaypointSupervisor(Node):
         )
 
         self.pub_waypoints = self.create_publisher(PoseArray, self.waypoints_topic, 10)
-        self.pub_yaw_override = self.create_publisher(
-            YawOverride, self.yaw_override_topic, 10)
 
         self.timer = self.create_timer(self.publish_period_s, self.tick)
-        self._yaw_override_timer = self.create_timer(
-            1.0 / self.yaw_scan_publish_hz, self._yaw_override_tick)
 
         self.get_logger().info(
-            "pad_waypoint_supervisor started.\n"
-            f" odom_topic={self.odom_topic}\n"
-            f" base_det_topic={self.base_det_topic}\n"
-            f" front_det_topic={self.front_det_topic or '(disabled)'}\n"
-            f" down_det_topic={self.down_det_topic or '(disabled)'}\n"
-            f" h_det_topic={self.h_det_topic} aim_at_h={self.aim_at_h} "
-            f"h_timeout_s={self.h_timeout_s} max_h_base_separation_m={self.max_h_base_separation_m}\n"
-            f" waypoints_topic={self.waypoints_topic}\n"
-            f" controller_state_topic={self.controller_state_topic}\n"
-            f" mission_cycle_done_topic={self.mission_cycle_done_topic}\n"
-            f" use_mission_cycle_done={self.use_mission_cycle_done} "
-            f"mission_cycle_timeout_s={self.mission_cycle_timeout_s} "
-            f"({'disabled' if self.mission_cycle_timeout_s <= 0.0 else f'{self.mission_cycle_timeout_s:.1f}s'})\n"
-            f" world_frame_id={self.world_frame_id} (NOTE: treated numerically as the odom frame)\n"
-            f" z_fixed={self.z_fixed}\n"
-            f" bases_to_visit={self.bases_to_visit}\n"
-            f" cluster_tol_m={self.cluster_tol_m} min_seen_count={self.min_seen_count}\n"
-            f" invert_right_axis={self.invert_right_axis} "
-            f"invert_front_axis={self.invert_front_axis} "
-            f"invert_yaw={self.invert_yaw}\n"
-            f" target_offset_right_m={self.target_offset_right_m} "
-            f"target_offset_front_m={self.target_offset_front_m}\n"
-            f" max_detection_range_m={self.max_detection_range_m} "
-            f"max_jump_m={self.max_jump_m}\n"
-            f" lost_timeout_s={self.lost_timeout_s} "
-            f"yaw_scan_cooldown_s={self.yaw_scan_cooldown_s}\n"
-            f" yaw_override_topic={self.yaw_override_topic} "
-            f"yaw_scan_rate_rad_s={self.yaw_scan_rate_rad_s} "
-            f"yaw_scan_publish_hz={self.yaw_scan_publish_hz} "
-            f"yaw_scan_dur={self._yaw_scan_dur_eff:.1f}s"
+            "pad_waypoint_supervisor started (simplified).\n"
+            f"  odom_topic={self.odom_topic}\n"
+            f"  base_det_topic={self.base_det_topic}\n"
+            f"  waypoints_topic={self.waypoints_topic}\n"
+            f"  controller_state_topic={self.controller_state_topic}\n"
+            f"  world_frame_id={self.world_frame_id}  z_fixed={self.z_fixed}\n"
+            f"  bases_to_visit={self.bases_to_visit}\n"
+            f"  cluster_tol_m={self.cluster_tol_m}  min_seen_count={self.min_seen_count}\n"
+            f"  reach_tol_m={self.reach_tol_m}  inter_base_wait_s={self.inter_base_wait_s}"
         )
-        if not self.use_mission_cycle_done:
-            self.get_logger().info(
-                "[STANDALONE] use_mission_cycle_done=False — "
-                "supervisor will NOT wait for /mission_cycle_done handshake. "
-                "Bases are marked visited immediately upon reaching the target."
-            )
-        elif self.mission_cycle_timeout_s > 0.0:
-            self.get_logger().info(
-                f"[HANDSHAKE] use_mission_cycle_done=True with "
-                f"mission_cycle_timeout_s={self.mission_cycle_timeout_s:.1f}s — "
-                "will force progress if handshake is not received within the timeout."
-            )
 
-    def cb_finished(self, msg: Bool):
-        self.trajectory_finished = bool(msg.data)
-        self._last_finished_msg_t = time.time()
-        if msg.data and not self.ready_for_commands:
-            self.ready_for_commands = True
-            self.get_logger().info("[READY] Controller signaled /trajectory_finished. Enabling waypoint publishing.")
-
-    def cb_mission_cycle_done(self, msg: Bool):
-        if msg.data and self.state == "WAIT_MISSION_DONE":
-            self.mission_cycle_done = True
-            self.get_logger().info("[HANDSHAKE] /mission_cycle_done=true received — mission cycle complete.")
-        elif msg.data:
-            self.get_logger().debug(
-                f"[HANDSHAKE] /mission_cycle_done=true received but ignored (state={self.state})."
-            )
-
-    def cb_yaw_scan_done(self, msg: Bool):
-        if msg.data and not self.yaw_scan_done:
-            self.yaw_scan_done = True
-            self.ready_for_commands = True
-            confirmed = [c for c in self.candidates if c.seen_count >= self.min_seen_count]
-            self.get_logger().info(
-                f"[SCAN] /yaw_scan_done=true — 360° scan complete. "
-                f"{len(confirmed)} confirmed base(s) discovered (of {len(self.candidates)} candidate(s)):"
-            )
-            for i, c in enumerate(confirmed):
-                self.get_logger().info(
-                    f"[SCAN]   base #{i}: map ({c.x:.2f}, {c.y:.2f}) m  seen={c.seen_count}"
-                )
-
-    def cb_state_voo(self, msg: Int32):
-        self.state_voo = int(msg.data)
+    # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def cb_odom(self, msg: Odometry):
         self.have_odom = True
@@ -333,309 +144,105 @@ class PadWaypointSupervisor(Node):
         q = msg.pose.pose.orientation
         self.cur_yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
 
-        # Capture home position from the very first odom message
-        if not self._have_home_from_odom:
-            self._have_home_from_odom = True
-            self._home_from_odom_x = self.cur_x
-            self._home_from_odom_y = self.cur_y
-            self.get_logger().info(
-                f"[HOME] Home captured from first odom: "
-                f"({self._home_from_odom_x:.2f}, {self._home_from_odom_y:.2f})"
-            )
-
-            # Derive world_frame_id from odom header when the parameter is the
-            # ambiguous default 'map' (most MAVROS setups use e.g. 'uav1/map').
+        if not self._have_home:
+            self._have_home = True
+            self.home_x = self.cur_x
+            self.home_y = self.cur_y
             if self.world_frame_id == "map" and msg.header.frame_id:
                 self.world_frame_id = msg.header.frame_id
                 self.get_logger().info(
-                    f"[FRAME] world_frame_id overridden from first odom header: "
-                    f"'{self.world_frame_id}'"
+                    f"[FRAME] world_frame_id set from odom header: '{self.world_frame_id}'"
                 )
+            self.get_logger().info(
+                f"[HOME] Captured home from first odom: ({self.home_x:.2f}, {self.home_y:.2f})"
+            )
 
-    def cb_h_det(self, msg: PointStamped):
-        """Store the latest H-marker relative position (right=x, front=y in base_link)."""
-        right = float(msg.point.x)
-        front = float(msg.point.y)
-        if self.invert_right_axis:
-            right = -right
-        if self.invert_front_axis:
-            front = -front
-        right += self.target_offset_right_m
-        front += self.target_offset_front_m
-        self._h_right = right
-        self._h_front = front
-        self._h_last_t = time.monotonic()
+    def cb_state_voo(self, msg: Int32):
+        self.state_voo = int(msg.data)
 
-    def cb_det(self, msg: PointStamped, source: str):
+    def cb_det(self, msg: PointStamped):
+        """Accumulate base detections into the candidate list."""
         if not self.have_odom:
             return
-
-        # Do not accumulate candidates until the controller has signaled readiness,
-        # except during the initial SCAN phase when we intentionally collect data.
-        if not self.ready_for_commands and self.state != "SCAN":
+        if self.state == "DONE":
+            return
+        # Collect detections while hovering (2) or navigating (3)
+        if self.state_voo not in (2, 3):
             return
 
-        # Gate on controller state: allow HOVER (2) and NAVIGATING (3).
-        # During the initial SCAN phase the drone is rotating in place (HOVER),
-        # so we skip the state gate entirely to ensure detections are captured.
-        if self.state not in ("SCAN",) and self.state_voo not in (2, 3):
-            now = time.time()
-            if now - self._last_state_warn_t >= 2.0:
-                self._last_state_warn_t = now
-                self.get_logger().warning(
-                    f"[{source}] Detection received but controller state={self.state_voo}"
-                    " (need 2=HOVER or 3=NAVIGATING). Ignoring."
-                )
-            return
+        # Detection convention: msg.point.x = right, msg.point.y = front (drone body frame)
+        right = float(msg.point.x)
+        front = float(msg.point.y)
 
-        # msg.point convention (same for base_relative_position and legacy optical topics):
-        #  - x = right  (drone body frame, +right = drone's starboard side)
-        #  - y = front  (drone body frame, +forward = nose direction)
-        #  - z = fixed altitude (unused here)
-        # Mapping to ROS base_link (x_bl = forward, y_bl = left):
-        #   x_bl = front_detection,  y_bl = left = -right_detection
-        # so the ENU rotation is: dx = cos(yaw)*front + sin(yaw)*right,
-        #                         dy = sin(yaw)*front - cos(yaw)*right.
-
-        stamp = msg.header.stamp
-        if stamp.sec == 0 and stamp.nanosec == 0:
-            now_t = time.time()
-            if now_t - self._last_zero_stamp_warn_t >= 2.0:
-                self._last_zero_stamp_warn_t = now_t
-                self.get_logger().warning(
-                    f"[{source}] Received PointStamped with zero stamp; using current time as fallback."
-                )
-
-        raw_x = float(msg.point.x)
-        raw_y = float(msg.point.y)
-
-        self.get_logger().debug(
-            f"[{source}] raw detection: x(right)={raw_x:.3f} y(front)={raw_y:.3f}"
-        )
-
-        right = raw_x
-        front = raw_y
-
-        # Optional axis inversions — all default False for the standard convention
-        # (x=right, y=front).  Enable via ROS parameters if your detector or yaw
-        # source uses a different sign convention.
-        if self.invert_right_axis:
-            right = -right
-        if self.invert_front_axis:
-            front = -front
-
-        if self.invert_right_axis or self.invert_front_axis:
-            self.get_logger().debug(
-                f"[{source}] after axis inversion: right={right:.3f} front={front:.3f}"
-            )
-
-        # Fine-tuning offsets (applied in base_link before world projection)
-        if self.target_offset_right_m != 0.0 or self.target_offset_front_m != 0.0:
-            right += self.target_offset_right_m
-            front += self.target_offset_front_m
-            self.get_logger().debug(
-                f"[{source}] offsets applied: right={right:.3f} front={front:.3f}"
-            )
-
-        # Outlier rejection: range check
-        det_range = math.hypot(right, front)
-        if det_range > self.max_detection_range_m:
-            self.get_logger().warning(
-                f"[{source}] Detection discarded: range={det_range:.2f}m > "
-                f"max_detection_range_m={self.max_detection_range_m}m "
-                f"(right={right:.2f} front={front:.2f})"
-            )
-            return
-
-        # Outlier rejection: jump check from last accepted detection
-        if self._have_last_accepted:
-            jump = math.hypot(
-                right - self._last_accepted_right,
-                front - self._last_accepted_front,
-            )
-            if jump > self.max_jump_m:
-                self.get_logger().warning(
-                    f"[{source}] Detection discarded: jump={jump:.2f}m > "
-                    f"max_jump_m={self.max_jump_m}m "
-                    f"(right={right:.2f} front={front:.2f})"
-                )
-                return
-
-        # Detection accepted — update last accepted position
-        self._have_last_accepted = True
-        self._last_accepted_right = right
-        self._last_accepted_front = front
-
-        # Store latest base relative position for H gating
-        self._base_right = right
-        self._base_front = front
-        self._base_last_t = time.monotonic()
-
-        # Project to world frame (2D) using odom yaw — no TF required.
-        #
-        # Detection (body frame, this node's convention):
-        #   right_det = +drone-right,  front_det = +drone-forward
-        # ROS base_link (REP-103): x_bl = forward, y_bl = left (left-positive)
-        #   x_bl = front_det,  y_bl = left = -right_det
-        # ENU rotation by yaw (CCW positive from +X toward +Y):
-        #   dx_world = cos(yaw)*x_bl - sin(yaw)*y_bl
-        #            = cos(yaw)*front_det + sin(yaw)*right_det
-        #   dy_world = sin(yaw)*x_bl + cos(yaw)*y_bl
-        #            = sin(yaw)*front_det - cos(yaw)*right_det
-        yaw = -self.cur_yaw if self.invert_yaw else self.cur_yaw
-        dx_map = front * math.cos(yaw) + right * math.sin(yaw)
-        dy_map = front * math.sin(yaw) - right * math.cos(yaw)
-
-        bx = self.cur_x + dx_map
-        by = self.cur_y + dy_map
-
-        self.get_logger().debug(
-            f"[{source}] projection: right={right:.3f} front={front:.3f} "
-            f"yaw={yaw:.3f}rad  dx={dx_map:.3f} dy={dy_map:.3f}  "
-            f"cur=({self.cur_x:.2f},{self.cur_y:.2f})  "
-            f"bx={bx:.3f} by={by:.3f}"
-        )
+        # Project to world frame (ENU) using odom yaw (no TF required).
+        #   dx_world = cos(yaw)*front + sin(yaw)*right
+        #   dy_world = sin(yaw)*front - cos(yaw)*right
+        yaw = self.cur_yaw
+        bx = self.cur_x + front * math.cos(yaw) + right * math.sin(yaw)
+        by = self.cur_y + front * math.sin(yaw) - right * math.cos(yaw)
 
         self._update_candidates(bx, by)
 
         now = time.time()
-        if not hasattr(self, "_last_det_info_t"):
-            self._last_det_info_t = 0.0
         if now - self._last_det_info_t >= 1.0:
             self._last_det_info_t = now
             max_seen = max((c.seen_count for c in self.candidates), default=0)
             self.get_logger().info(
-                f"[{source}] det ok: raw=({raw_x:.2f},{raw_y:.2f}) "
-                f"right={right:.2f} front={front:.2f} "
-                f"yaw={yaw:.3f}rad "
+                f"[det] right={right:.2f} front={front:.2f} yaw={yaw:.3f}rad "
                 f"bx={bx:.2f} by={by:.2f} "
                 f"candidates={len(self.candidates)} max_seen={max_seen} "
                 f"state={self.state} state_voo={self.state_voo}"
             )
 
+    # ── Candidate management ───────────────────────────────────────────────────
+
     def _update_candidates(self, bx: float, by: float):
         now = time.time()
-
-        # Drop stale unvisited candidates — but NOT during the initial scan so that bases
-        # seen early in the 360° rotation aren't pruned before the scan ends.
-        # Visited candidates are always retained so the node remembers visited bases.
-        if self.state != "SCAN":
-            self.candidates = [
-                c for c in self.candidates
-                if c.visited or (now - c.last_seen_s) <= self.candidate_timeout_s
-            ]
-
-        # Merge into existing if close
+        # Merge into the closest existing cluster within cluster_tol_m
         for c in self.candidates:
             if math.hypot(c.x - bx, c.y - by) <= self.cluster_tol_m:
-                # exponential moving average update
                 alpha = 0.3
                 c.x = (1 - alpha) * c.x + alpha * bx
                 c.y = (1 - alpha) * c.y + alpha * by
                 c.last_seen_s = now
                 c.seen_count += 1
-                # Track when we last had a detection that contributes to a candidate
-                self._last_valid_candidate_t = time.monotonic()
                 return
-
-        # New candidate
+        # New candidate cluster
         self.candidates.append(BaseCandidate(x=bx, y=by, last_seen_s=now, seen_count=1))
-        self._last_valid_candidate_t = time.monotonic()
-
-    def _try_yaw_scan_recovery(self):
-        """Trigger an in-node yaw-only 360 scan (yaw override) if not already scanning."""
-        if self._yaw_scan_active:
-            return
-        # Only start scan when drone is in HOVER (state_voo == 2)
-        if self.state_voo != 2:
-            return
-        now = time.monotonic()
-        if now - self._last_yaw_scan_t < self.yaw_scan_cooldown_s:
-            return
-        self._yaw_scan_active = True
-        self._yaw_scan_start_t = now
-        self._last_yaw_scan_t = now
-        self.get_logger().warning(
-            "[LOST] No valid base candidate found for "
-            f"{self.lost_timeout_s:.1f}s — starting in-node yaw-360 scan "
-            f"(rate={self.yaw_scan_rate_rad_s:.2f}rad/s "
-            f"duration={self._yaw_scan_dur_eff:.1f}s)."
-        )
-
-    def _yaw_override_tick(self):
-        """Publishes YawOverride commands at yaw_scan_publish_hz while scan is active."""
-        if not self._yaw_scan_active:
-            return
-        msg = YawOverride()
-        msg.enable = True
-        msg.yaw_rate = self.yaw_scan_rate_rad_s
-        msg.timeout = 2.0 / self.yaw_scan_publish_hz
-        self.pub_yaw_override.publish(msg)
-
-    def _pick_next_target(self) -> Optional[Tuple[float, float]]:
-        # Debug: log full candidate list each time we pick
-        now = time.time()
-        confirmed = [c for c in self.candidates if c.seen_count >= self.min_seen_count]
-        visited_conf = [c for c in confirmed if c.visited]
-        unvisited_conf = [c for c in confirmed if not c.visited]
         self.get_logger().info(
-            f"[PICK] bases confirmed={len(confirmed)} visited={len(visited_conf)} "
-            f"remaining={len(unvisited_conf)} "
-            f"(total_candidates={len(self.candidates)} "
-            f"visited_count={self.visited_count}/{self.bases_to_visit}):"
+            f"[candidates] New candidate #{len(self.candidates)} at ({bx:.2f}, {by:.2f})"
         )
-        for i, c in enumerate(self.candidates):
-            blocked = any(
-                math.hypot(c.x - vx, c.y - vy) <= self.repeat_block_m
-                for vx, vy in self.visited_positions
-            )
-            age_s = now - c.last_seen_s
-            self.get_logger().info(
-                f"[PICK]   #{i}: map=({c.x:.2f},{c.y:.2f}) "
-                f"seen={c.seen_count} age={age_s:.1f}s "
-                f"visited={c.visited} blocked={blocked}"
-            )
 
-        # Choose nearest unvisited candidate with enough evidence
-        best = None
-        best_d = None
+    def _pick_next_target(self, log: bool = False) -> Optional[Tuple[float, float]]:
+        """Return (x, y) of the nearest confirmed unvisited base, or None."""
+        best: Optional[BaseCandidate] = None
+        best_d: float = math.inf
         for c in self.candidates:
-            if c.visited:
-                continue
-            if c.seen_count < self.min_seen_count:
-                continue
-            # Anti-repeat guard: skip candidates too close to any previously
-            # visited position (based on actual drone odom at visit time).
-            if any(
-                math.hypot(c.x - vx, c.y - vy) <= self.repeat_block_m
-                for vx, vy in self.visited_positions
-            ):
+            if c.visited or c.seen_count < self.min_seen_count:
                 continue
             d = math.hypot(c.x - self.cur_x, c.y - self.cur_y)
-            if best is None or d < best_d:
+            if d < best_d:
                 best = c
                 best_d = d
         if best is None:
             return None
-        self.get_logger().info(
-            f"[PICK] Selected: map=({best.x:.2f},{best.y:.2f}) "
-            f"seen={best.seen_count} dist={best_d:.2f}m"
-        )
+        if log:
+            self.get_logger().info(
+                f"[PICK] Next target: ({best.x:.2f}, {best.y:.2f}) "
+                f"dist={best_d:.2f}m seen={best.seen_count} "
+                f"visited={self.visited_count}/{self.bases_to_visit}"
+            )
         return (best.x, best.y)
 
-    def _mark_visited(self, x: float, y: float):
+    def _mark_visited_at_odom(self):
+        """Mark candidates near the current odom position as visited."""
         for c in self.candidates:
-            if math.hypot(c.x - x, c.y - y) <= self.cluster_tol_m:
+            if math.hypot(c.x - self.cur_x, c.y - self.cur_y) <= self.cluster_tol_m:
                 c.visited = True
 
-    def _yaw_toward(
-        self, from_x: float, from_y: float, to_x: float, to_y: float
-    ) -> Tuple[float, float]:
-        """Return (qz, qw) quaternion components for a yaw that faces (to_x,to_y) from (from_x,from_y)."""
-        theta = math.atan2(to_y - from_y, to_x - from_x)
-        return math.sin(theta / 2.0), math.cos(theta / 2.0)
+    # ── Waypoint publisher ─────────────────────────────────────────────────────
 
-    def _publish_two_pose_waypoints(self, tx: float, ty: float):
+    def _publish_waypoint(self, tx: float, ty: float):
         pa = PoseArray()
         pa.header.stamp = self.get_clock().now().to_msg()
         pa.header.frame_id = self.world_frame_id
@@ -644,285 +251,109 @@ class PadWaypointSupervisor(Node):
         p0.position.x = float(self.cur_x)
         p0.position.y = float(self.cur_y)
         p0.position.z = float(self.z_fixed)
+        p0.orientation.w = 1.0
 
         p1 = Pose()
         p1.position.x = float(tx)
         p1.position.y = float(ty)
         p1.position.z = float(self.z_fixed)
-
-        # Determine orientation: aim_at_h takes priority over aim_at_home.
-        h_fresh = (time.monotonic() - self._h_last_t) <= self.h_timeout_s
-        base_fresh = (time.monotonic() - self._base_last_t) <= self.h_timeout_s
-        # Gate H: discard if H relative position is too far from the latest base detection.
-        h_sep = math.hypot(
-            self._h_right - self._base_right,
-            self._h_front - self._base_front,
-        ) if (h_fresh and base_fresh) else float("inf")
-        h_valid = h_fresh and base_fresh and (h_sep <= self.max_h_base_separation_m)
-        if self.aim_at_h and h_fresh and not h_valid:
-            self.get_logger().debug(
-                f"[aim_at_h] H discarded: sep={h_sep:.2f}m > "
-                f"max_h_base_separation_m={self.max_h_base_separation_m}m"
-            )
-        if self.aim_at_h and h_valid:
-            # Project H relative position (right, front in base_link) to world frame
-            # using the current drone yaw from MAVROS odom (no TF required).
-            #   world_dx = front * cos(yaw) + right * sin(yaw)
-            #   world_dy = front * sin(yaw) - right * cos(yaw)
-            yaw = self.cur_yaw
-            h_dx = self._h_front * math.cos(yaw) + self._h_right * math.sin(yaw)
-            h_dy = self._h_front * math.sin(yaw) - self._h_right * math.cos(yaw)
-            h_map_x = self.cur_x + h_dx
-            h_map_y = self.cur_y + h_dy
-            # yaw_target = atan2(h_world.y - drone.y, h_world.x - drone.x)
-            # Use the same drone-to-H direction for both current and target poses so
-            # the camera stays locked on H throughout navigation.
-            qz, qw = self._yaw_toward(self.cur_x, self.cur_y, h_map_x, h_map_y)
-            p0.orientation.z = qz
-            p0.orientation.w = qw
-            p1.orientation.z = qz
-            p1.orientation.w = qw
-            self.get_logger().debug(
-                f"[aim_at_h] H at world ({h_map_x:.2f},{h_map_y:.2f}); "
-                f"yaw toward H set on both poses."
-            )
-        elif self.aim_at_h and not h_valid:
-            self.get_logger().debug(
-                "[aim_at_h] No valid H detection (timeout or gated); using identity orientation."
-            )
-            p0.orientation.w = 1.0
-            p1.orientation.w = 1.0
-        elif self.aim_at_home and self._have_home_from_odom:
-            qz0, qw0 = self._yaw_toward(
-                self.cur_x, self.cur_y,
-                self._home_from_odom_x, self._home_from_odom_y,
-            )
-            p0.orientation.z = qz0
-            p0.orientation.w = qw0
-            qz1, qw1 = self._yaw_toward(
-                tx, ty,
-                self._home_from_odom_x, self._home_from_odom_y,
-            )
-            p1.orientation.z = qz1
-            p1.orientation.w = qw1
-        elif self.aim_at_home and not self._have_home_from_odom:
-            self.get_logger().warning(
-                "[aim_at_home] Home position not yet captured from odom; "
-                "using identity orientation until first odom is received."
-            )
-            p0.orientation.w = 1.0
-            p1.orientation.w = 1.0
-        else:
-            p0.orientation.w = 1.0
-            p1.orientation.w = 1.0
+        p1.orientation.w = 1.0
 
         pa.poses = [p0, p1]
         self.pub_waypoints.publish(pa)
+
+    # ── Main FSM tick ──────────────────────────────────────────────────────────
 
     def tick(self):
         if not self.have_odom:
             return
 
-        # Manage in-node yaw-360 scan lifecycle
-        if self._yaw_scan_active:
-            now_m = time.monotonic()
-            elapsed_scan = now_m - self._yaw_scan_start_t
-            confirmed_now = any(
-                c.seen_count >= self.min_seen_count for c in self.candidates
-            )
-            if elapsed_scan >= self._yaw_scan_dur_eff or confirmed_now:
-                self._yaw_scan_active = False
-                stop_msg = YawOverride()
-                stop_msg.enable = False
-                stop_msg.yaw_rate = 0.0
-                stop_msg.timeout = 0.0
-                self.pub_yaw_override.publish(stop_msg)
-                self._last_valid_candidate_t = now_m
-                reason = "candidate found" if confirmed_now else f"duration {elapsed_scan:.1f}s"
-                self.get_logger().info(
-                    f"[LOST] Yaw-360 scan ended ({reason}). "
-                    f"confirmed={confirmed_now} candidates={len(self.candidates)}"
-                )
-
-        # Update lost-timer whenever a confirmed candidate exists
-        confirmed_any = any(
-            c.seen_count >= self.min_seen_count for c in self.candidates
-        )
-        if confirmed_any:
-            self._last_valid_candidate_t = time.monotonic()
-
-        # State machine
-        if self.state == "SCAN":
-            # Collect detections passively while supervisor_T runs the yaw scan.
-            # Advance when /yaw_scan_done is received OR the fallback timer expires.
-            elapsed = time.time() - self._scan_start_t
-            scan_timed_out = self.scan_duration_s > 0 and elapsed >= self.scan_duration_s
-            if self.yaw_scan_done or scan_timed_out:
-                if scan_timed_out and not self.yaw_scan_done:
-                    self.get_logger().warning(
-                        f"[SCAN] Timeout ({elapsed:.1f}s) — /yaw_scan_done not received. "
-                        "Advancing to DISCOVER anyway.")
-                    self.ready_for_commands = True
-                confirmed = [c for c in self.candidates if c.seen_count >= self.min_seen_count]
-                self.get_logger().info(
-                    f"[SCAN→DISCOVER] {len(confirmed)} confirmed base(s) found. "
-                    "Starting mission sequencing.")
-                self.state = "DISCOVER"
-            return
-
-        if self.state == "DISCOVER":
-            if self.visited_count >= self.bases_to_visit:
-                self.get_logger().info("All bases visited. Switching to RETURN_HOME.")
-                self.state = "RETURN_HOME"
-                self.active_target = (self.home_x, self.home_y)
-                return
-
-            nxt = self._pick_next_target()
+        if self.state == "COLLECT":
+            # Wait until at least one confirmed unvisited base is available.
+            nxt = self._pick_next_target(log=True)
             if nxt is None:
-                # Check if all confirmed candidates are already visited/blocked —
-                # if so there is nothing left to find and we should go home rather
-                # than waiting indefinitely (fixes "stuck at last base" regression).
-                confirmed = [c for c in self.candidates if c.seen_count >= self.min_seen_count]
-                all_done = bool(confirmed) and all(
-                    c.visited or any(
-                        math.hypot(c.x - vx, c.y - vy) <= self.repeat_block_m
-                        for vx, vy in self.visited_positions
-                    )
-                    for c in confirmed
-                )
-                if all_done:
-                    self.get_logger().info(
-                        f"[DISCOVER] All {len(confirmed)} confirmed candidate(s) visited/blocked "
-                        f"but only {self.visited_count}/{self.bases_to_visit} counted. "
-                        "No more targets available — switching to RETURN_HOME."
-                    )
-                    self.state = "RETURN_HOME"
-                    self.active_target = (self.home_x, self.home_y)
-                    return
-                # No valid target yet — check for "lost" condition and trigger yaw recovery
-                if not confirmed:
-                    elapsed_lost = time.monotonic() - self._last_valid_candidate_t
-                    if elapsed_lost > self.lost_timeout_s:
-                        self._try_yaw_scan_recovery()
-                # Still discovering bases (or waiting for more detections)
                 return
-
             self.active_target = nxt
-            self.get_logger().info(f"Target selected: x={nxt[0]:.2f} y={nxt[1]:.2f} (visited={self.visited_count}/{self.bases_to_visit})")
+            self.get_logger().info(
+                f"[STATE] COLLECT → NAVIGATE target=({nxt[0]:.2f}, {nxt[1]:.2f})"
+            )
             self.state = "NAVIGATE"
 
         if self.state == "NAVIGATE":
             if self.active_target is None:
-                self.state = "DISCOVER"
+                self.state = "COLLECT"
                 return
+
+            # Re-evaluate every tick: always fly to the nearest confirmed
+            # unvisited base, updating immediately when a closer one appears.
+            # active_target also tracks EMA position drift of the current base.
+            nxt = self._pick_next_target()
+            if nxt is not None:
+                old_tx, old_ty = self.active_target
+                if math.hypot(nxt[0] - old_tx, nxt[1] - old_ty) > self.cluster_tol_m:
+                    # Target has switched to a genuinely different base
+                    new_d = math.hypot(nxt[0] - self.cur_x, nxt[1] - self.cur_y)
+                    cur_d = math.hypot(old_tx - self.cur_x, old_ty - self.cur_y)
+                    self.get_logger().info(
+                        f"[NAVIGATE] Closer base found: switching target "
+                        f"({old_tx:.2f}, {old_ty:.2f}) d={cur_d:.2f}m → "
+                        f"({nxt[0]:.2f}, {nxt[1]:.2f}) d={new_d:.2f}m"
+                    )
+                # Always update to latest EMA position of the best candidate
+                self.active_target = nxt
 
             tx, ty = self.active_target
-            if self.state_voo in (2, 3):
-                self._publish_two_pose_waypoints(tx, ty)
-            else:
-                now = time.time()
-                if now - self._last_state_warn_t >= 5.0:
-                    self._last_state_warn_t = now
-                    self.get_logger().warning(
-                        f"[NAVIGATE] state_voo={self.state_voo} "
-                        "(need 2=HOVER or 3=NAVIGATING) — holding waypoint publish."
-                    )
+
+            # Only publish when the controller is in HOVER (state_voo == 2)
+            if self.state_voo == 2:
+                self._publish_waypoint(tx, ty)
 
             d = math.hypot(tx - self.cur_x, ty - self.cur_y)
             if d <= self.reach_tol_m:
-                if not self.use_mission_cycle_done:
-                    # Standalone mode: mark visited immediately without waiting for handshake.
-                    visit_x = self.cur_x
-                    visit_y = self.cur_y
-                    self._mark_visited(visit_x, visit_y)
-                    self.visited_positions.append((visit_x, visit_y))
-                    self.visited_count += 1
-                    self.get_logger().info(
-                        f"[STATE] Reached base within {self.reach_tol_m}m (d={d:.2f}). "
-                        f"Standalone mode (use_mission_cycle_done=False): base marked visited at odom "
-                        f"({visit_x:.2f}, {visit_y:.2f}). "
-                        f"visited={self.visited_count}/{self.bases_to_visit}. "
-                        "Transitioning to DISCOVER.")
-                    self.active_target = None
-                    self.state = "DISCOVER"
-                else:
-                    self.get_logger().info(
-                        f"[STATE] Reached base within {self.reach_tol_m}m (d={d:.2f}). "
-                        "Waiting for mission cycle to complete (WAIT_MISSION_DONE).")
-                    self.state = "WAIT_MISSION_DONE"
-                    # Reset handshake flag to discard any stale signal that arrived
-                    # before we entered this state (e.g. from the previous cycle).
-                    self.mission_cycle_done = False
-                    self._wait_mission_start_t = time.monotonic()
-                return
-
-        if self.state == "WAIT_MISSION_DONE":
-            # Hold position — do not publish new navigation targets.
-            # Wait until supervisor_T signals that missao_P_T has finished.
-
-            # Standalone mode: should not normally reach this state, but handle
-            # it defensively in case the state is entered via an external trigger.
-            if not self.use_mission_cycle_done:
-                self.get_logger().warning(
-                    "[WAIT_MISSION_DONE] Reached in standalone mode (use_mission_cycle_done=False). "
-                    "This indicates an unexpected state transition — forcing immediate progress."
+                # Mark base as visited using the actual odom position
+                self._mark_visited_at_odom()
+                self.visited_count += 1
+                self.get_logger().info(
+                    f"[STATE] Reached base #{self.visited_count} within {self.reach_tol_m}m "
+                    f"(d={d:.2f}m) at odom ({self.cur_x:.2f}, {self.cur_y:.2f}). "
+                    f"Entering inter-base wait ({self.inter_base_wait_s:.1f}s)."
                 )
-                self.mission_cycle_done = True
+                self._wait_start_t = time.monotonic()
+                self.active_target = None
+                self.state = "WAIT_BETWEEN_BASES"
+            return
 
-            # Optional timeout: force progress if handshake never arrives.
-            if not self.mission_cycle_done and self.mission_cycle_timeout_s > 0.0:
-                elapsed = time.monotonic() - self._wait_mission_start_t
-                if elapsed >= self.mission_cycle_timeout_s:
-                    self.get_logger().warning(
-                        f"[WAIT_MISSION_DONE] Timeout after {elapsed:.1f}s "
-                        f"(mission_cycle_timeout_s={self.mission_cycle_timeout_s:.1f}s) — "
-                        "/mission_cycle_done not received. Forcing progress."
-                    )
-                    self.mission_cycle_done = True
-
-            if not self.mission_cycle_done:
+        if self.state == "WAIT_BETWEEN_BASES":
+            # Hold quiet — detections still accumulate via cb_det.
+            elapsed = time.monotonic() - self._wait_start_t
+            if elapsed < self.inter_base_wait_s:
                 return
-
-            # Mission cycle done: mark this base as visited using the actual
-            # drone odom position (not the target coordinates) so that the
-            # repeat_block_m guard correctly covers the real landing spot.
-            visit_x = self.cur_x
-            visit_y = self.cur_y
-            self._mark_visited(visit_x, visit_y)
-            self.visited_positions.append((visit_x, visit_y))
-
-            self.visited_count += 1
-            # Reset for next cycle (the pre-state reset at entry guarded against
-            # stale signals; this reset ensures a clean state going forward).
-            self.mission_cycle_done = False
             self.get_logger().info(
-                f"[STATE] Mission cycle done — base marked visited at odom "
-                f"({visit_x:.2f}, {visit_y:.2f}). "
+                f"[STATE] Inter-base wait complete ({elapsed:.1f}s). "
                 f"visited={self.visited_count}/{self.bases_to_visit}. "
-                "Transitioning to DISCOVER.")
-            self.active_target = None
-            self.state = "DISCOVER"
+                "Selecting next target."
+            )
+            if self.visited_count >= self.bases_to_visit:
+                self.get_logger().info("[STATE] All bases visited. Switching to RETURN_HOME.")
+                self.state = "RETURN_HOME"
+            else:
+                self.state = "COLLECT"
+            return
 
         if self.state == "RETURN_HOME":
-            # publish until reached home, then DONE
-            tx, ty = (self.home_x, self.home_y)
-            if self.state_voo in (2, 3):
-                self._publish_two_pose_waypoints(tx, ty)
-            else:
-                now = time.time()
-                if now - self._last_state_warn_t >= 5.0:
-                    self._last_state_warn_t = now
-                    self.get_logger().warning(
-                        f"[RETURN_HOME] state_voo={self.state_voo} "
-                        "(need 2=HOVER or 3=NAVIGATING) — holding waypoint publish."
-                    )
-            d = math.hypot(tx - self.cur_x, ty - self.cur_y)
+            if not self._have_home:
+                return
+            if self.state_voo == 2:
+                self._publish_waypoint(self.home_x, self.home_y)
+            d = math.hypot(self.home_x - self.cur_x, self.home_y - self.cur_y)
             if d <= self.reach_tol_m:
-                self.get_logger().info("Returned home. DONE.")
+                self.get_logger().info(
+                    f"[STATE] Returned home (d={d:.2f}m). Mission complete. DONE."
+                )
                 self.state = "DONE"
-
-        if self.state == "DONE":
             return
+
+        # state == "DONE": nothing to do
 
 
 def main():
