@@ -9,9 +9,10 @@
 //                 waits for it to exit, then transitions to WAIT_TRAJ.
 //   WAIT_TRAJ   → Monitors /trajectory_progress and /trajectory_finished;
 //                 transitions to RUN_MISSION when a trajectory completes.
-//   RUN_MISSION → Forks missao_P_T (or pouso when use_origin_as_base=true and
-//                 the UAV is at the origin), waits for it to exit, then loops
-//                 back to WAIT_TRAJ for the next cycle (infinite loop).
+//   RUN_MISSION → Forks missao_P_T (or pouso with use_current_xy:=true when
+//                 use_origin_as_base=true and the UAV is at the origin), waits
+//                 for it to exit, then loops back to WAIT_TRAJ for the next
+//                 cycle (infinite loop).
 //
 // Trajectory-detection logic (WAIT_TRAJ only):
 //   • /trajectory_progress < 99.9  → new trajectory in progress (reset guards)
@@ -23,20 +24,20 @@
 // Stale-signal protection (post_reset_ticks_):
 //   When transitioning from TAKING_OFF or RUN_MISSION to WAIT_TRAJ the
 //   subscription queues may still hold trajectory signals that were published
-//   by missao_P_T's pouso sub-process while the supervisor was in RUN_MISSION.
+//   by the pouso sub-process while the supervisor was in RUN_MISSION.
 //   post_reset_ticks_ is set to POST_RESET_COOLDOWN_TICKS on every such
 //   transition.  check_trajectory() discards any signals that arrive during
-//   those ticks, preventing a spurious re-launch of missao_P_T.
+//   those ticks, preventing a spurious re-launch.
 //
 // All child processes are spawned via fork()/execlp() and reaped with
 // waitpid(WNOHANG) inside the FSM timer to keep the executor unblocked.
 //
 // Parameters:
 //   uav_name            (string, default "uav1")  — UAV namespace prefix
-//   use_origin_as_base  (bool,   default false)   — when true, launch pouso
-//                         instead of missao_P_T if the drone is within 0.1 m
-//                         of (0,0) at trajectory completion; when false (the
-//                         default) always launch missao_P_T.
+//   use_origin_as_base  (bool,   default true)    — when true (default), launch
+//                         pouso with use_current_xy:=true instead of missao_P_T
+//                         if the drone is within 0.1 m of (0,0) at trajectory
+//                         completion; when false, always launch missao_P_T.
 //
 // Usage:
 //   ros2 run drone_control supervisor_T
@@ -85,7 +86,7 @@ public:
         this->declare_parameter<std::string>("uav_name", "uav1");
         uav_name_ = this->get_parameter("uav_name").as_string();
 
-        this->declare_parameter<bool>("use_origin_as_base", false);
+        this->declare_parameter<bool>("use_origin_as_base", true);
         use_origin_as_base_ = this->get_parameter("use_origin_as_base").as_bool();
 
         progress_sub_ = this->create_subscription<std_msgs::msg::Float32>(
@@ -323,9 +324,9 @@ private:
         }
 
         // Determine which executable to launch next.
-        // When use_origin_as_base_=false (default), always run missao_P_T.
-        // When use_origin_as_base_=true, run pouso only if the UAV is within
-        // BASE_TOL metres of the origin; otherwise run missao_P_T.
+        // When use_origin_as_base_=true (default) and the drone is within BASE_TOL
+        // of the origin, launch pouso with use_current_xy:=true (local position).
+        // Otherwise (use_origin_as_base_=false, or drone not at origin), run missao_P_T.
         static constexpr double BASE_TOL = 0.1;
         const bool at_base =
             use_origin_as_base_ &&
@@ -333,13 +334,13 @@ private:
             (std::abs(current_x_) <= BASE_TOL) &&
             (std::abs(current_y_) <= BASE_TOL);
 
-        const char * next_exec = at_base ? "pouso" : "missao_P_T";
+        const char * next_exec = at_base ? "pouso (use_current_xy)" : "missao_P_T";
         current_child_exec_ = next_exec;
 
         if (at_base) {
             RCLCPP_INFO(this->get_logger(),
                 "[WAIT_TRAJ] 🏁 Trajetória concluída e UAV no ponto base "
-                "(x=%.2f y=%.2f) — lançando pouso…",
+                "(x=%.2f y=%.2f) — lançando pouso com posição local…",
                 current_x_, current_y_);
         } else if (!odom_received_) {
             RCLCPP_WARN(this->get_logger(),
@@ -351,7 +352,7 @@ private:
                 current_x_, current_y_);
         }
 
-        child_pid_ = fork_exec(next_exec);
+        child_pid_ = at_base ? fork_exec_pouso_local() : fork_exec("missao_P_T");
         if (child_pid_ > 0) {
             reset_trajectory_guards();
             state_ = SupervisorState::RUN_MISSION;
@@ -424,6 +425,21 @@ private:
         if (pid == 0) {
             execlp("ros2", "ros2", "run", "drone_control", "drone_yaw_360",
                    "--ros-args", "-p", "yaw_target_delta:=6.2831853",
+                   static_cast<char *>(nullptr));
+            _exit(1);
+        }
+        return pid;   // > 0 in parent on success; -1 on fork failure
+    }
+
+    // Launches: ros2 run drone_control pouso
+    //              --ros-args -p use_current_xy:=true
+    // Used when the drone has returned to the origin so that it lands at the
+    // current local position instead of running the full missao_P_T sequence.
+    pid_t fork_exec_pouso_local() {
+        pid_t pid = fork();
+        if (pid == 0) {
+            execlp("ros2", "ros2", "run", "drone_control", "pouso",
+                   "--ros-args", "-p", "use_current_xy:=true",
                    static_cast<char *>(nullptr));
             _exit(1);
         }
