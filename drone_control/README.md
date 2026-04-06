@@ -77,12 +77,63 @@ ros2 run drone_control missao_P_T
 
 ### `pouso`
 
-Publishes a landing waypoint at the current (or specified) XY position on the
-map.
+Navigates the drone to a target XY position and lands using a two-phase FSM
+that avoids oscillation caused by mid-descent waypoint republishing.
+
+**Landing phases:**
+
+1. **CENTER** — publishes a single hover waypoint at the target XY and a
+   configurable approach altitude.  The node stays in this phase until
+   `dxy ≤ xy_hold_tol` continuously for `xy_hold_stable_s` seconds (prevents
+   transient pass-through from triggering an early descent).
+2. **DESCEND** — publishes a single descent waypoint to `landing_z`.
+   Waypoints are **not** reissued on minor XY drift during descent.  If drift
+   exceeds `xy_abort_tol` the node reverts to CENTER so the drone climbs back
+   to `approach_z` and recentres before retrying.
 
 ```bash
 ros2 run drone_control pouso
+# custom tolerances
+ros2 run drone_control pouso --ros-args \
+  -p xy_hold_tol:=0.15 \
+  -p xy_abort_tol:=0.4 \
+  -p xy_hold_stable_s:=1.5 \
+  -p approach_z:=1.5
 ```
+
+**Parameters:**
+
+| Parameter         | Default | Description |
+|-------------------|---------|-------------|
+| `uav_name`        | `uav1`  | UAV namespace prefix |
+| `x`               | `0.0`   | Target landing X (ENU, m) — ignored when `use_current_xy=true` |
+| `y`               | `0.0`   | Target landing Y (ENU, m) — ignored when `use_current_xy=true` |
+| `use_current_xy`  | `true`  | Use live odom XY as target instead of `x`/`y` |
+| `landing_z`       | `0.05`  | Final ground altitude (m) |
+| `frame_id`        | `map`   | Coordinate frame |
+| `rate_hz`         | `10.0`  | Timer rate (Hz) |
+| `check_after_sec` | `15.0`  | Overall timeout (s) before giving up |
+| `xy_hold_tol`     | `0.10`  | Max planar error (m) to be considered centred |
+| `xy_hold_stable_s`| `1.0`   | Seconds to remain within `xy_hold_tol` before starting descent |
+| `xy_abort_tol`    | `0.5`   | Abort descent and recentre if XY error exceeds this (m) |
+| `approach_z`      | `-1.0`  | Hover altitude for CENTER phase (m); `-1` = use current odom Z |
+| `use_yolo_h`      | `false` | Use YOLO-detected H marker as landing target |
+| `h_topic`         | `/landing_pad/h_relative_position` | YOLO H detection topic |
+| `h_collect_time_s`| `1.0`   | Seconds to collect H detections before selecting best |
+| `h_timeout_s`     | `0.75`  | Max age (s) for H detection window entries |
+| `max_h_range_m`   | `6.0`   | Max range (m) to accept a YOLO H detection |
+| `prefer_closest_h`| `true`  | Select H closest to drone; `false` = latest |
+
+**Log messages to expect:**
+
+| Message | Meaning |
+|---------|---------|
+| `🎯 Entrando em CENTER: dxy=X.XX m …` | Entering CENTER phase (also on abort/recentre) |
+| `🎯 CENTER: dxy=X.XX m …` | Periodic status during centering |
+| `✅ Centrado: dxy=… por Y.Ys. Iniciando descida…` | Stable centering achieved; transitioning to DESCEND |
+| `⬇️  DESCEND: Z=…` | Periodic status during descent |
+| `⚠️  Deriva excessiva durante descida: dxy=… > xy_abort_tol=…` | Aborting descent; returning to CENTER |
+| `✅ Pouso concluído: …` | Landing complete; node exits |
 
 ### `takeoff`
 
