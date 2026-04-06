@@ -73,8 +73,15 @@ class PadWaypointSupervisor(Node):
         self.declare_parameter("h_timeout_s", 3.0)          # discard H position if older than this
         self.declare_parameter("max_h_base_separation_m", 0.5)  # discard H if H_rel vs base_rel distance exceeds this
 
-        # Axis correction: flip the incoming right (x) axis to fix systematic lateral bias
-        self.declare_parameter("invert_right_axis", True)
+        # Axis correction flags — allow runtime sign flips without code changes.
+        # Detection convention: msg.point.x = right, msg.point.y = front (in uav1/base_link).
+        # The projection formula already handles this convention correctly, so all flags
+        # default to False.  Set invert_right_axis=True only if your detector publishes
+        # x=left; set invert_front_axis=True if it publishes y=back; set invert_yaw=True
+        # if the odom yaw sign appears inverted relative to the world frame.
+        self.declare_parameter("invert_right_axis", False)
+        self.declare_parameter("invert_front_axis", False)
+        self.declare_parameter("invert_yaw", False)
         # Fine-tuning offsets applied in base_link before world projection
         self.declare_parameter("target_offset_right_m", 0.0)
         self.declare_parameter("target_offset_front_m", 0.0)
@@ -120,6 +127,8 @@ class PadWaypointSupervisor(Node):
         self.max_h_base_separation_m = float(self.get_parameter("max_h_base_separation_m").value)
 
         self.invert_right_axis = bool(self.get_parameter("invert_right_axis").value)
+        self.invert_front_axis = bool(self.get_parameter("invert_front_axis").value)
+        self.invert_yaw = bool(self.get_parameter("invert_yaw").value)
         self.target_offset_right_m = float(self.get_parameter("target_offset_right_m").value)
         self.target_offset_front_m = float(self.get_parameter("target_offset_front_m").value)
         self.max_detection_range_m = float(self.get_parameter("max_detection_range_m").value)
@@ -233,7 +242,9 @@ class PadWaypointSupervisor(Node):
             f" bases_to_visit={self.bases_to_visit}\n"
             f" cluster_tol_m={self.cluster_tol_m} min_seen_count={self.min_seen_count}\n"
             f" invert_right_axis={self.invert_right_axis} "
-            f"target_offset_right_m={self.target_offset_right_m} "
+            f"invert_front_axis={self.invert_front_axis} "
+            f"invert_yaw={self.invert_yaw}\n"
+            f" target_offset_right_m={self.target_offset_right_m} "
             f"target_offset_front_m={self.target_offset_front_m}\n"
             f" max_detection_range_m={self.max_detection_range_m} "
             f"max_jump_m={self.max_jump_m}\n"
@@ -291,12 +302,23 @@ class PadWaypointSupervisor(Node):
                 f"({self._home_from_odom_x:.2f}, {self._home_from_odom_y:.2f})"
             )
 
+            # Derive world_frame_id from odom header when the parameter is the
+            # ambiguous default 'map' (most MAVROS setups use e.g. 'uav1/map').
+            if self.world_frame_id == "map" and msg.header.frame_id:
+                self.world_frame_id = msg.header.frame_id
+                self.get_logger().info(
+                    f"[FRAME] world_frame_id overridden from first odom header: "
+                    f"'{self.world_frame_id}'"
+                )
+
     def cb_h_det(self, msg: PointStamped):
         """Store the latest H-marker relative position (right=x, front=y in base_link)."""
         right = float(msg.point.x)
         front = float(msg.point.y)
         if self.invert_right_axis:
             right = -right
+        if self.invert_front_axis:
+            front = -front
         right += self.target_offset_right_m
         front += self.target_offset_front_m
         self._h_right = right
@@ -326,9 +348,13 @@ class PadWaypointSupervisor(Node):
             return
 
         # msg.point convention (same for base_relative_position and legacy optical topics):
-        #  - x = right (drone body frame, +right)
-        #  - y = front (drone body frame, +forward)
+        #  - x = right  (drone body frame, +right = drone's starboard side)
+        #  - y = front  (drone body frame, +forward = nose direction)
         #  - z = fixed altitude (unused here)
+        # Mapping to ROS base_link (x_bl = forward, y_bl = left):
+        #   x_bl = front_detection,  y_bl = left = -right_detection
+        # so the ENU rotation is: dx = cos(yaw)*front + sin(yaw)*right,
+        #                         dy = sin(yaw)*front - cos(yaw)*right.
 
         stamp = msg.header.stamp
         if stamp.sec == 0 and stamp.nanosec == 0:
@@ -339,14 +365,27 @@ class PadWaypointSupervisor(Node):
                     f"[{source}] Received PointStamped with zero stamp; using current time as fallback."
                 )
 
-        right = float(msg.point.x)
-        front = float(msg.point.y)
+        raw_x = float(msg.point.x)
+        raw_y = float(msg.point.y)
 
-        # Axis inversion: flip right (x) sign to correct systematic lateral bias
+        self.get_logger().debug(
+            f"[{source}] raw detection: x(right)={raw_x:.3f} y(front)={raw_y:.3f}"
+        )
+
+        right = raw_x
+        front = raw_y
+
+        # Optional axis inversions — all default False for the standard convention
+        # (x=right, y=front).  Enable via ROS parameters if your detector or yaw
+        # source uses a different sign convention.
         if self.invert_right_axis:
             right = -right
+        if self.invert_front_axis:
+            front = -front
+
+        if self.invert_right_axis or self.invert_front_axis:
             self.get_logger().debug(
-                f"[{source}] invert_right_axis: x flipped to {right:.3f}"
+                f"[{source}] after axis inversion: right={right:.3f} front={front:.3f}"
             )
 
         # Fine-tuning offsets (applied in base_link before world projection)
@@ -392,14 +431,29 @@ class PadWaypointSupervisor(Node):
         self._base_last_t = time.monotonic()
 
         # Project to world frame (2D) using odom yaw — no TF required.
-        # dx_map = front*cos(yaw) + right*sin(yaw)
-        # dy_map = front*sin(yaw) - right*cos(yaw)
-        yaw = self.cur_yaw
+        #
+        # Detection (body frame, this node's convention):
+        #   right_det = +drone-right,  front_det = +drone-forward
+        # ROS base_link (REP-103): x_bl = forward, y_bl = left (left-positive)
+        #   x_bl = front_det,  y_bl = left = -right_det
+        # ENU rotation by yaw (CCW positive from +X toward +Y):
+        #   dx_world = cos(yaw)*x_bl - sin(yaw)*y_bl
+        #            = cos(yaw)*front_det + sin(yaw)*right_det
+        #   dy_world = sin(yaw)*x_bl + cos(yaw)*y_bl
+        #            = sin(yaw)*front_det - cos(yaw)*right_det
+        yaw = -self.cur_yaw if self.invert_yaw else self.cur_yaw
         dx_map = front * math.cos(yaw) + right * math.sin(yaw)
         dy_map = front * math.sin(yaw) - right * math.cos(yaw)
 
         bx = self.cur_x + dx_map
         by = self.cur_y + dy_map
+
+        self.get_logger().debug(
+            f"[{source}] projection: right={right:.3f} front={front:.3f} "
+            f"yaw={yaw:.3f}rad  dx={dx_map:.3f} dy={dy_map:.3f}  "
+            f"cur=({self.cur_x:.2f},{self.cur_y:.2f})  "
+            f"bx={bx:.3f} by={by:.3f}"
+        )
 
         self._update_candidates(bx, by)
 
@@ -410,7 +464,10 @@ class PadWaypointSupervisor(Node):
             self._last_det_info_t = now
             max_seen = max((c.seen_count for c in self.candidates), default=0)
             self.get_logger().info(
-                f"[{source}] det ok: bx={bx:.2f} by={by:.2f} "
+                f"[{source}] det ok: raw=({raw_x:.2f},{raw_y:.2f}) "
+                f"right={right:.2f} front={front:.2f} "
+                f"yaw={yaw:.3f}rad "
+                f"bx={bx:.2f} by={by:.2f} "
                 f"candidates={len(self.candidates)} max_seen={max_seen} "
                 f"state={self.state} state_voo={self.state_voo}"
             )
