@@ -40,8 +40,10 @@ class PadWaypointSupervisor(Node):
 
         # Parameters
         self.declare_parameter("odom_topic", "/uav1/mavros/local_position/odom")
-        self.declare_parameter("front_det_topic", "/landing_pad/front_optical_point")
-        self.declare_parameter("down_det_topic", "/landing_pad/down_optical_point")
+        self.declare_parameter("base_det_topic", "/landing_pad/base_relative_position")
+        # Legacy per-camera optical-frame topics; set to "" to disable
+        self.declare_parameter("front_det_topic", "")
+        self.declare_parameter("down_det_topic", "")
         self.declare_parameter("waypoints_topic", "/waypoints")
 
         self.declare_parameter("trajectory_finished_topic", "/trajectory_finished")
@@ -51,12 +53,12 @@ class PadWaypointSupervisor(Node):
         self.declare_parameter("scan_duration_s", 35.0)   # fallback: auto-advance SCAN after this many seconds
         self.declare_parameter("controller_state_topic", "/drone_controller/state_voo")
 
-        self.declare_parameter("map_frame", "uav1/map")     # used in PoseArray.header.frame_id
+        self.declare_parameter("world_frame_id", "map")  # output PoseArray header frame_id; treated numerically as odom
         self.declare_parameter("z_fixed", 1.5)
         self.declare_parameter("bases_to_visit", 6)
 
         self.declare_parameter("cluster_tol_m", 1.2)        # merge detections within this radius
-        self.declare_parameter("min_seen_count", 3)         # require stable detection before accepting a base
+        self.declare_parameter("min_seen_count", 6)         # require stable detection before accepting a base
         self.declare_parameter("candidate_timeout_s", 30.0) # drop candidates not seen recently
 
         self.declare_parameter("publish_period_s", 0.25)    # how often to republish target while navigating
@@ -68,8 +70,10 @@ class PadWaypointSupervisor(Node):
         self.declare_parameter("aim_at_h", True)            # orient waypoints to face toward detected H marker
         self.declare_parameter("h_det_topic", "/landing_pad/h_relative_position")
         self.declare_parameter("h_timeout_s", 3.0)          # discard H position if older than this
+        self.declare_parameter("max_h_base_separation_m", 0.5)  # discard H if H_rel vs base_rel distance exceeds this
 
         self.odom_topic = self.get_parameter("odom_topic").value
+        self.base_det_topic = self.get_parameter("base_det_topic").value
         self.front_det_topic = self.get_parameter("front_det_topic").value
         self.down_det_topic = self.get_parameter("down_det_topic").value
         self.waypoints_topic = self.get_parameter("waypoints_topic").value
@@ -81,7 +85,7 @@ class PadWaypointSupervisor(Node):
         self.scan_duration_s = float(self.get_parameter("scan_duration_s").value)
         self.controller_state_topic = self.get_parameter("controller_state_topic").value
 
-        self.map_frame = self.get_parameter("map_frame").value
+        self.world_frame_id = self.get_parameter("world_frame_id").value
         self.z_fixed = float(self.get_parameter("z_fixed").value)
         self.bases_to_visit = int(self.get_parameter("bases_to_visit").value)
 
@@ -98,6 +102,7 @@ class PadWaypointSupervisor(Node):
         self.aim_at_h = bool(self.get_parameter("aim_at_h").value)
         self.h_det_topic = self.get_parameter("h_det_topic").value
         self.h_timeout_s = float(self.get_parameter("h_timeout_s").value)
+        self.max_h_base_separation_m = float(self.get_parameter("max_h_base_separation_m").value)
 
         # State
         self.have_odom = False
@@ -135,10 +140,22 @@ class PadWaypointSupervisor(Node):
         self._h_front: float = 0.0
         self._h_last_t: float = 0.0   # monotonic time of last H detection
 
+        # Latest base detection in base_link frame (right, front) used for H gating
+        self._base_right: float = 0.0
+        self._base_front: float = 0.0
+        self._base_last_t: float = 0.0  # monotonic time of last base detection
+
         # ROS I/O
         self.sub_odom = self.create_subscription(Odometry, self.odom_topic, self.cb_odom, 10)
-        self.sub_front = self.create_subscription(PointStamped, self.front_det_topic, lambda m: self.cb_det(m, "front"), 10)
-        self.sub_down = self.create_subscription(PointStamped, self.down_det_topic, lambda m: self.cb_det(m, "down"), 10)
+        self.sub_base = self.create_subscription(
+            PointStamped, self.base_det_topic, lambda m: self.cb_det(m, "base"), 10)
+        # Legacy per-camera optical-frame topics (only subscribed if topic is non-empty)
+        if self.front_det_topic:
+            self.sub_front = self.create_subscription(
+                PointStamped, self.front_det_topic, lambda m: self.cb_det(m, "front"), 10)
+        if self.down_det_topic:
+            self.sub_down = self.create_subscription(
+                PointStamped, self.down_det_topic, lambda m: self.cb_det(m, "down"), 10)
         self.sub_h_det = self.create_subscription(
             PointStamped, self.h_det_topic, self.cb_h_det, 10)
 
@@ -169,13 +186,16 @@ class PadWaypointSupervisor(Node):
         self.get_logger().info(
             "pad_waypoint_supervisor started.\n"
             f" odom_topic={self.odom_topic}\n"
-            f" front_det_topic={self.front_det_topic}\n"
-            f" down_det_topic={self.down_det_topic}\n"
-            f" h_det_topic={self.h_det_topic} aim_at_h={self.aim_at_h} h_timeout_s={self.h_timeout_s}\n"
+            f" base_det_topic={self.base_det_topic}\n"
+            f" front_det_topic={self.front_det_topic or '(disabled)'}\n"
+            f" down_det_topic={self.down_det_topic or '(disabled)'}\n"
+            f" h_det_topic={self.h_det_topic} aim_at_h={self.aim_at_h} "
+            f"h_timeout_s={self.h_timeout_s} max_h_base_separation_m={self.max_h_base_separation_m}\n"
             f" waypoints_topic={self.waypoints_topic}\n"
             f" controller_state_topic={self.controller_state_topic}\n"
             f" mission_cycle_done_topic={self.mission_cycle_done_topic}\n"
-            f" map_frame={self.map_frame} z_fixed={self.z_fixed}\n"
+            f" world_frame_id={self.world_frame_id} (NOTE: treated numerically as the odom frame)\n"
+            f" z_fixed={self.z_fixed}\n"
             f" bases_to_visit={self.bases_to_visit}\n"
             f" cluster_tol_m={self.cluster_tol_m} min_seen_count={self.min_seen_count}"
         )
@@ -230,10 +250,6 @@ class PadWaypointSupervisor(Node):
                 f"({self._home_from_odom_x:.2f}, {self._home_from_odom_y:.2f})"
             )
 
-        # Update map frame from odom if it looks namespaced (optional)
-        if msg.header.frame_id:
-            self.map_frame = msg.header.frame_id
-
     def cb_h_det(self, msg: PointStamped):
         """Store the latest H-marker relative position (right=x, front=y in base_link)."""
         self._h_right = float(msg.point.x)
@@ -262,10 +278,10 @@ class PadWaypointSupervisor(Node):
                 )
             return
 
-        # msg.point is in optical frame. Our detector currently publishes:
-        #  - x ~ X_optical (right)
-        #  - y ~ Y_optical (down)   [not used]
-        #  - z ~ Z_optical (forward)
+        # msg.point convention (same for base_relative_position and legacy optical topics):
+        #  - x = right (drone body frame, +right)
+        #  - y = front (drone body frame, +forward)
+        #  - z = fixed altitude (unused here)
 
         stamp = msg.header.stamp
         if stamp.sec == 0 and stamp.nanosec == 0:
@@ -279,7 +295,14 @@ class PadWaypointSupervisor(Node):
         right = float(msg.point.x)
         front = float(msg.point.y)
 
-        # Project to map (2D)
+        # Store latest base relative position for H gating
+        self._base_right = right
+        self._base_front = front
+        self._base_last_t = time.monotonic()
+
+        # Project to world frame (2D) using odom yaw — no TF required.
+        # dx_map = front*cos(yaw) + right*sin(yaw)
+        # dy_map = front*sin(yaw) - right*cos(yaw)
         yaw = self.cur_yaw
         dx_map = front * math.cos(yaw) + right * math.sin(yaw)
         dy_map = front * math.sin(yaw) - right * math.cos(yaw)
@@ -387,7 +410,7 @@ class PadWaypointSupervisor(Node):
     def _publish_two_pose_waypoints(self, tx: float, ty: float):
         pa = PoseArray()
         pa.header.stamp = self.get_clock().now().to_msg()
-        pa.header.frame_id = self.map_frame
+        pa.header.frame_id = self.world_frame_id
 
         p0 = Pose()
         p0.position.x = float(self.cur_x)
@@ -401,30 +424,43 @@ class PadWaypointSupervisor(Node):
 
         # Determine orientation: aim_at_h takes priority over aim_at_home.
         h_fresh = (time.monotonic() - self._h_last_t) <= self.h_timeout_s
-        if self.aim_at_h and h_fresh:
-            # Project H relative position (right, front in base_link) to map frame
-            # using the current drone yaw.  The body→map rotation is:
-            #   map_dx = front * cos(yaw) + right * sin(yaw)
-            #   map_dy = front * sin(yaw) - right * cos(yaw)
-            # (same formula used for projecting base detections to map).
+        base_fresh = (time.monotonic() - self._base_last_t) <= self.h_timeout_s
+        # Gate H: discard if H relative position is too far from the latest base detection.
+        h_sep = math.hypot(
+            self._h_right - self._base_right,
+            self._h_front - self._base_front,
+        ) if (h_fresh and base_fresh) else float("inf")
+        h_valid = h_fresh and base_fresh and (h_sep <= self.max_h_base_separation_m)
+        if self.aim_at_h and h_fresh and not h_valid:
+            self.get_logger().debug(
+                f"[aim_at_h] H discarded: sep={h_sep:.2f}m > "
+                f"max_h_base_separation_m={self.max_h_base_separation_m}m"
+            )
+        if self.aim_at_h and h_valid:
+            # Project H relative position (right, front in base_link) to world frame
+            # using the current drone yaw from MAVROS odom (no TF required).
+            #   world_dx = front * cos(yaw) + right * sin(yaw)
+            #   world_dy = front * sin(yaw) - right * cos(yaw)
             yaw = self.cur_yaw
             h_dx = self._h_front * math.cos(yaw) + self._h_right * math.sin(yaw)
             h_dy = self._h_front * math.sin(yaw) - self._h_right * math.cos(yaw)
             h_map_x = self.cur_x + h_dx
             h_map_y = self.cur_y + h_dy
-            qz0, qw0 = self._yaw_toward(self.cur_x, self.cur_y, h_map_x, h_map_y)
-            p0.orientation.z = qz0
-            p0.orientation.w = qw0
-            qz1, qw1 = self._yaw_toward(tx, ty, h_map_x, h_map_y)
-            p1.orientation.z = qz1
-            p1.orientation.w = qw1
+            # yaw_target = atan2(h_world.y - drone.y, h_world.x - drone.x)
+            # Use the same drone-to-H direction for both current and target poses so
+            # the camera stays locked on H throughout navigation.
+            qz, qw = self._yaw_toward(self.cur_x, self.cur_y, h_map_x, h_map_y)
+            p0.orientation.z = qz
+            p0.orientation.w = qw
+            p1.orientation.z = qz
+            p1.orientation.w = qw
             self.get_logger().debug(
-                f"[aim_at_h] H at map ({h_map_x:.2f},{h_map_y:.2f}); "
+                f"[aim_at_h] H at world ({h_map_x:.2f},{h_map_y:.2f}); "
                 f"yaw toward H set on both poses."
             )
-        elif self.aim_at_h and not h_fresh:
+        elif self.aim_at_h and not h_valid:
             self.get_logger().debug(
-                "[aim_at_h] No fresh H detection (timeout); using identity orientation."
+                "[aim_at_h] No valid H detection (timeout or gated); using identity orientation."
             )
             p0.orientation.w = 1.0
             p1.orientation.w = 1.0
