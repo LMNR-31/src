@@ -63,6 +63,59 @@ warning and forces progress (marks visited, continues to next base).
 | `use_mission_cycle_done`   | bool  | `true`  | If `false`, skip the `/mission_cycle_done` handshake entirely (standalone mode). |
 | `mission_cycle_timeout_s`  | float | `0.0`   | Seconds to wait for `/mission_cycle_done` before forcing progress. `0.0` disables the timeout. Only used when `use_mission_cycle_done=true`. |
 
+### H-marker final centering
+
+When `enable_h_centering` is `true` (the default), the supervisor uses the YOLO
+H-marker topic (`/landing_pad/h_relative_position`) to perform a final centering
+pass before marking a base as reached.  The same coordinate projection formula
+used for base detections is applied to the H detection to compute a world-frame
+target `(hx, hy)`:
+
+```
+dx_world = cos(yaw)*front_H + sin(yaw)*right_H
+dy_world = sin(yaw)*front_H - cos(yaw)*right_H
+```
+
+**Behaviour:**
+
+1. While navigating to a base, once the drone is within `centering_start_dist_m`
+   of the candidate center **and** a fresh H detection is available (received
+   within the last `h_timeout_s` seconds), the supervisor switches the commanded
+   waypoint from the candidate EMA position to the projected H center `(hx, hy)`.
+2. The base is only considered **reached** when the drone is within
+   `centering_reach_tol_m` of `(hx, hy)` (instead of the normal `reach_tol_m`).
+3. If H detections become stale while centering, the supervisor falls back to
+   the candidate center and normal `reach_tol_m` criterion (a throttled warning
+   is logged).
+4. With `enable_h_centering:=false` the behaviour is identical to the original
+   (no H subscription influence on reach logic).
+
+| Parameter                | Type  | Default                               | Description |
+|--------------------------|-------|---------------------------------------|-------------|
+| `h_det_topic`            | string | `/landing_pad/h_relative_position`   | Topic for YOLO H-marker detections (`geometry_msgs/PointStamped`). |
+| `enable_h_centering`     | bool  | `true`                                | Enable H-marker final centering. Set to `false` to restore original behaviour. |
+| `centering_start_dist_m` | float | `0.6`                                 | World-frame distance to active base below which centering mode activates. |
+| `centering_reach_tol_m`  | float | `0.05`                                | Required XY distance to the H-marker world target to consider the base reached (when centering is active). |
+| `h_timeout_s`            | float | `0.5`                                 | Maximum age of an H detection for it to be considered fresh. |
+| `max_h_range_m`          | float | `6.0`                                 | Maximum body-frame range of an H detection; detections beyond this are ignored. |
+
+Example — enable centering with tighter tolerance:
+
+```bash
+ros2 run yolo_pad_pose pad_waypoint_supervisor --ros-args \
+  -p enable_h_centering:=true \
+  -p centering_start_dist_m:=0.6 \
+  -p centering_reach_tol_m:=0.05 \
+  -p h_timeout_s:=0.5
+```
+
+Example — disable centering (original behaviour):
+
+```bash
+ros2 run yolo_pad_pose pad_waypoint_supervisor --ros-args \
+  -p enable_h_centering:=false
+```
+
 ### Outlier rejection and robustness parameters
 
 These parameters prevent phantom / noisy detections from polluting the
