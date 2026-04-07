@@ -135,8 +135,8 @@ class YoloPadPose(Node):
         )
 
         # Throttle state for range-rejection warnings (one per class, at most 1 Hz).
-        self._base_range_warn_t: float = 0.0
-        self._h_range_warn_t: float = 0.0
+        self._base_range_warn_t: float = -float('inf')
+        self._h_range_warn_t: float = -float('inf')
 
     def _detection_to_base_link(
         self,
@@ -236,6 +236,10 @@ class YoloPadPose(Node):
             if cls not in best_by_class or conf_val > best_by_class[cls][0]:
                 best_by_class[cls] = (conf_val, x1, y1, x2, y2)
 
+        # Read range-limit parameters once per callback (supports ros2 param set).
+        max_base_range_m = float(self.get_parameter("max_base_range_m").value)
+        max_h_range_m = float(self.get_parameter("max_h_range_m").value)
+
         # Process base detection (class base_class_id)
         if self.base_class_id in best_by_class:
             conf_val, x1, y1, x2, y2 = best_by_class[self.base_class_id]
@@ -246,9 +250,6 @@ class YoloPadPose(Node):
             )
             if result is not None:
                 out_base, Z = result
-                max_base_range_m = float(
-                    self.get_parameter("max_base_range_m").value
-                )
                 right = out_base.point.x
                 front = out_base.point.y
                 if not range_filter_check(right, front, max_base_range_m):
@@ -285,9 +286,6 @@ class YoloPadPose(Node):
             )
             if result is not None:
                 out_h, Z = result
-                max_h_range_m = float(
-                    self.get_parameter("max_h_range_m").value
-                )
                 right = out_h.point.x
                 front = out_h.point.y
                 if not range_filter_check(right, front, max_h_range_m):
