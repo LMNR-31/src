@@ -110,7 +110,7 @@ public:
       current_x_(0.0),
       current_y_(0.0),
       use_origin_as_base_(false),
-      wait_after_traj_done_s_(5.0),
+      wait_after_traj_done_s_(0.0),
       wait_start_time_(0, 0, RCL_ROS_TIME),  // sentinel; overwritten in check_trajectory()
       min_relaunch_dist_m_(0.5),
       last_mission_valid_(false),
