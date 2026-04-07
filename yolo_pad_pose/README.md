@@ -37,10 +37,27 @@ ros2 run yolo_pad_pose pad_waypoint_nn --ros-args \
 | `dwell_s`                 | float  | `5.0`                                 | Seconds to wait at each visited base before selecting the next. |
 | `publish_period_s`        | float  | `0.25`                                | Waypoint re-publish interval (s). |
 | `max_detection_range_m`   | float  | `6.0`                                 | Reject body-frame detections beyond this range (m). Set `0` to disable. |
-| `max_jump_m`              | float  | `2.0`                                 | Reject body-frame detections that jump more than this between callbacks (m). |
+| `max_jump_m`              | float  | `2.0`                                 | **Deprecated** – no longer applied. The body-frame jump filter has been replaced by world-frame clustering (`cluster_update`), which is compatible with YOLO switching between multiple bases. The parameter is kept for backward compatibility; set to `0` to silence the deprecation warning at startup. |
 | `require_all_bases`       | bool   | `true`                                | If `true`, return home only after `max_bases` bases are visited. If `false`, return home after all *currently known* confirmed bases are visited. |
 
-### Merge radius derivation
+### Multi-base tolerant detection
+
+All candidate bases are updated concurrently at any time, including while the
+drone is flying to another target.  When the YOLO detector switches between
+pads the detection jumps in body frame (typical ~3 m), which previously caused
+the old body-frame jump filter to discard the new pad entirely.
+
+The new approach:
+1. Each incoming detection is projected to **world frame** using the current
+   odometry yaw.
+2. The world-frame point is passed to `cluster_update`, which either:
+   - merges it into an existing base (within `merge_radius`), or
+   - adds it as a new base (if fewer than `max_bases` are tracked), or
+   - discards it silently (list full and no merge possible).
+3. The body-frame jump filter (`max_jump_m`) is **no longer applied**.
+   Outlier rejection relies on `max_detection_range_m` + `min_seen_count`.
+
+
 
 The merge area parameter (`merge_area_m2`, default 2.25 m²) is interpreted as
 the area of a circle whose radius defines the merge boundary:
@@ -71,6 +88,8 @@ wy = cur_y + front*sin(θ) - right*cos(θ)
 
 ```
 COLLECT → NAVIGATE → DWELL → NAVIGATE → … → RETURN_HOME → DONE
+                       ↓ (no confirmed unvisited base after dwell)
+                     COLLECT
 ```
 
 - **COLLECT**: collecting detections; transitions to NAVIGATE once at least
@@ -78,6 +97,11 @@ COLLECT → NAVIGATE → DWELL → NAVIGATE → … → RETURN_HOME → DONE
 - **NAVIGATE**: flying to the nearest unvisited confirmed base; publishes
   waypoints every `publish_period_s`.
 - **DWELL**: reached target; waits `dwell_s` before selecting next base.
+  The *"Dwell complete"* message is logged exactly once per dwell event.
+  After dwell:
+  - If a next confirmed unvisited base exists → transition to NAVIGATE.
+  - If no confirmed unvisited base exists yet → transition back to COLLECT
+    to wait for more bases to be discovered (avoids looping in DWELL).
 - **RETURN_HOME**: all bases visited; flying back to origin.
 - **DONE**: within `reach_tol_m` of home; node goes quiet.
 
