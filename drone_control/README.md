@@ -26,6 +26,13 @@ ros2 run drone_control supervisor_T
 ros2 run drone_control supervisor_T --ros-args \
   -p wait_after_traj_done_s:=5.0 \
   -p min_relaunch_dist_m:=0.5
+# stricter origin landing (requires 3 s of stability within 0.15 m):
+ros2 run drone_control supervisor_T --ros-args \
+  -p base_tol_m:=0.15 \
+  -p base_hold_s:=3.0 \
+  -p pouso_xy_hold_tol:=0.05 \
+  -p pouso_xy_hold_stable_s:=2.0 \
+  -p pouso_xy_abort_tol:=0.3
 ```
 
 **Topics monitored:**
@@ -37,12 +44,18 @@ ros2 run drone_control supervisor_T --ros-args \
 
 **Parameters:**
 
-| Parameter                | Type   | Default | Description                                         |
-|--------------------------|--------|---------|-----------------------------------------------------|
-| `uav_name`               | string | `uav1`  | UAV namespace prefix                                |
-| `use_origin_as_base`     | bool   | `true`  | Land at current XY when near origin instead of running missao_P_T |
-| `wait_after_traj_done_s` | double | `5.0`   | Seconds to wait after trajectory completion before launching next mission |
-| `min_relaunch_dist_m`    | double | `0.5`   | Minimum XY distance (m) the drone must have moved from the last mission launch position before a new mission is started; if closer, the mission is skipped to avoid landing twice in a row at the same spot (set to `0.0` to disable) |
+| Parameter                 | Type   | Default | Description                                        |
+|---------------------------|--------|---------|----------------------------------------------------|
+| `uav_name`                | string | `uav1`  | UAV namespace prefix                               |
+| `use_origin_as_base`      | bool   | `true`  | Land at current XY when stably near origin instead of running missao_P_T |
+| `wait_after_traj_done_s`  | double | `5.0`   | Seconds to wait after trajectory completion before launching next mission |
+| `min_relaunch_dist_m`     | double | `0.5`   | Minimum XY distance (m) the drone must have moved from the last mission launch position before a new mission is started; applies to both `missao_P_T` and `pouso` (local) launches; if closer, the mission is skipped (set to `0.0` to disable) |
+| `base_tol_m`              | double | `0.20`  | Radial tolerance (m) used to decide whether the UAV is at the origin; drone must be within `hypot(x,y) ≤ base_tol_m` |
+| `base_hold_s`             | double | `2.0`   | The UAV must remain within `base_tol_m` of the origin **continuously** for this many seconds before the local pouso is triggered; set to `0.0` to trigger immediately without a hold period |
+| `pouso_xy_hold_tol`       | double | `0.10`  | `xy_hold_tol` forwarded to `pouso` when landing at the origin (m) |
+| `pouso_xy_hold_stable_s`  | double | `1.0`   | `xy_hold_stable_s` forwarded to `pouso` when landing at the origin (s) |
+| `pouso_xy_abort_tol`      | double | `0.5`   | `xy_abort_tol` forwarded to `pouso` when landing at the origin (m) |
+| `pouso_approach_z`        | double | `-1.0`  | `approach_z` forwarded to `pouso` when landing at the origin (m); `-1.0` means use current odom Z |
 
 **Behaviour:**
 
@@ -54,14 +67,36 @@ ros2 run drone_control supervisor_T --ros-args \
    at least `min_relaunch_dist_m` from the last mission launch position; if
    not, the mission is **skipped** (logged as `⛔ Missão ignorada`) and the
    supervisor returns to `WAIT_TRAJ` to prevent landing twice at the same spot.
-4. If the position check passes, it logs
-   `⏱️  X.X s concluídos — lançando missao_P_T…` and launches the mission.
-5. Only **one** instance of `missao_P_T` runs at a time; extra triggers are
-   queued and processed in order.
+   This guard applies to both `missao_P_T` and `pouso` (local) launches.
+4. When `use_origin_as_base=true` (default), the supervisor checks whether the
+   drone is stably near the origin:
+   - The drone's odometry is tracked continuously; when
+     `hypot(x, y) ≤ base_tol_m` the supervisor starts a hold timer.
+   - If the drone leaves the zone, the hold timer resets; while accumulating,
+     a throttled log `🏠 UAV na zona base (dist=X.XXX m). Estabilidade: X.X s / X.X s…`
+     is emitted each second.
+   - Once `base_hold_s` continuous seconds inside the zone have elapsed,
+     `pouso` is launched with `use_current_xy:=true` and the extra parameters
+     (`pouso_xy_hold_tol`, `pouso_xy_hold_stable_s`, `pouso_xy_abort_tol`,
+     `pouso_approach_z`).
+   - If the drone is not at the origin (or `use_origin_as_base=false`), `missao_P_T`
+     is launched instead.
+5. Only **one** instance of `missao_P_T` / `pouso` runs at a time; extra
+   triggers are queued and processed in order.
 6. When a new trajectory starts (`/trajectory_finished == false` or
    `progress < 100`) the guards reset so the next completion triggers a new
    launch.
 7. Child processes are reaped via `waitpid(WNOHANG)` to avoid zombies.
+
+**Log messages to expect:**
+
+| Message | Meaning |
+|---------|---------|
+| `🏠 UAV entrou na zona base (dist=X.XXX m ≤ tol=X.XX m). Aguardando estabilidade de X.X s…` | Drone entered origin zone; hold timer started |
+| `🏠 UAV na zona base (dist=X.XXX m). Estabilidade: X.X s / X.X s…` | Hold timer accumulating (throttled, 1 s) |
+| `🏠 UAV na zona base há X.X s (dist=X.XXX m ≤ tol=X.XX m) — pouso local autorizado.` | Hold period complete; local pouso will be triggered |
+| `⏱️  X.X s concluídos. UAV no ponto base (x=X.XX y=X.XX) — lançando pouso com posição local (…)` | Launching local pouso with all parameters logged |
+| `⛔ Posição atual (X.XX, X.XX) está a X.XXm da última missão…` | Relaunch guard fired; mission skipped |
 
 ### `missao_P_T`
 
@@ -189,7 +224,30 @@ manually:
    Expected: `supervisor_T` logs `▶️  Nova trajetória detectada` and then
    launches `missao_P_T` a second time.
 
-3. **Build check:**
+3. **Origin landing with hold period:**
+
+   ```bash
+   # Start supervisor_T with short hold period for quick testing
+   ros2 run drone_control supervisor_T --ros-args \
+     -p base_tol_m:=0.20 \
+     -p base_hold_s:=2.0
+
+   # Simulate drone near origin via odometry
+   ros2 topic pub /uav1/mavros/local_position/odom \
+     nav_msgs/msg/Odometry \
+     "{pose: {pose: {position: {x: 0.05, y: 0.05, z: 1.0}}}}" --once
+
+   # Trigger trajectory completion
+   ros2 topic pub /trajectory_finished std_msgs/msg/Bool "data: true" --once
+   ```
+
+   Expected:
+   - `🏠 UAV entrou na zona base (dist=0.071 m ≤ tol=0.20 m). Aguardando estabilidade de 2.0 s…`
+   - After `wait_after_traj_done_s` elapses: `🏠 UAV na zona base (dist=0.071 m). Estabilidade: X.X s / 2.0 s…`
+   - After 2 s stability: `🏠 UAV na zona base há 2.X s … — pouso local autorizado.`
+   - Then: `⏱️  5.0 s concluídos. UAV no ponto base (x=0.05 y=0.05) — lançando pouso com posição local (xy_hold_tol=0.10, …)…`
+
+4. **Build check:**
 
    ```bash
    cd <workspace>
