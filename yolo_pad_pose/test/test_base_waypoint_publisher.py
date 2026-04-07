@@ -243,3 +243,95 @@ class TestBodyToWorld:
         )
         assert wx == pytest.approx(1.5)
         assert wy == pytest.approx(2.5)
+
+
+# ---------------------------------------------------------------------------
+# Multi-base tolerant detection (replaces body-frame jump filter)
+# ---------------------------------------------------------------------------
+
+
+class TestMultiBaseDetection:
+    """Tests that world-frame clustering supports concurrent multi-base discovery.
+
+    The old body-frame jump filter rejected any detection whose body-frame
+    position jumped more than ``max_jump_m`` (default 2.0 m) from the last
+    accepted detection.  When YOLO switched between bases (typical jump ~3 m)
+    the second base was silently dropped.
+
+    With the jump filter removed, ``cluster_update`` is the only gating
+    mechanism and correctly handles detections from different physical bases
+    by creating separate cluster entries.
+    """
+
+    def _make_base(self, x, y, seen=1):
+        return BaseEntry(x=x, y=y, seen_count=seen)
+
+    def test_two_far_apart_detections_both_registered(self):
+        """Two world-frame detections >2 m apart each become a separate base.
+
+        This scenario previously caused the second detection to be dropped by
+        the body-frame jump filter (jump ~3 m > max_jump_m=2 m).
+        """
+        bases = []
+        # Simulate first detection projected to world frame.
+        bases, a1 = cluster_update(bases, 0.0, 5.0, 0.846, 6)
+        assert a1 == 'added'
+        # Simulate second detection ~3 m away in world frame (YOLO switched pads).
+        bases, a2 = cluster_update(bases, 3.0, 5.0, 0.846, 6)
+        assert a2 == 'added'
+        assert len(bases) == 2
+
+    def test_six_distinct_bases_all_registered(self):
+        """All six distinct bases are registered even when spaced >2 m apart."""
+        bases = []
+        positions = [(float(i * 3), 0.0) for i in range(6)]
+        for x, y in positions:
+            bases, action = cluster_update(bases, x, y, 0.846, 6)
+            assert action == 'added'
+        assert len(bases) == 6
+
+    def test_seventh_base_discarded_when_full(self):
+        """When the list is full (6 bases), a 7th distinct cluster is discarded."""
+        bases = [self._make_base(float(i * 3), 0.0) for i in range(6)]
+        bases, action = cluster_update(bases, 100.0, 0.0, 0.846, 6)
+        assert action == 'discarded'
+        assert len(bases) == 6
+
+    def test_switch_then_return_to_first_base_merges(self):
+        """After jumping to a second base and back, the original base is updated."""
+        bases = []
+        # First detection → base #1 at (0, 5)
+        bases, _ = cluster_update(bases, 0.0, 5.0, 0.846, 6)
+        # Switch to base #2 at (4, 5)
+        bases, _ = cluster_update(bases, 4.0, 5.0, 0.846, 6)
+        assert len(bases) == 2
+        # Return to near base #1 → should merge, not add
+        bases, action = cluster_update(bases, 0.2, 5.1, 0.846, 6)
+        assert action == 'merged'
+        assert len(bases) == 2
+        assert bases[0].seen_count == 2
+
+    def test_alternating_two_bases_both_update(self):
+        """Alternating detections between two bases each increment their counts."""
+        bases = []
+        bases, _ = cluster_update(bases, 0.0, 0.0, 0.846, 6)   # base #1
+        bases, _ = cluster_update(bases, 5.0, 0.0, 0.846, 6)   # base #2
+        # Alternate 4 more times
+        for _ in range(2):
+            bases, _ = cluster_update(bases, 0.1, 0.0, 0.846, 6)   # → base #1
+            bases, _ = cluster_update(bases, 4.9, 0.0, 0.846, 6)   # → base #2
+        assert bases[0].seen_count == 3
+        assert bases[1].seen_count == 3
+
+    def test_merge_radius_separates_close_from_far(self):
+        """Detection within merge_radius merges; just beyond adds a new base."""
+        merge_r = 0.846
+        bases = [self._make_base(0.0, 0.0)]
+        # Within merge radius → merged
+        bases, a1 = cluster_update(bases, merge_r * 0.9, 0.0, merge_r, 6)
+        assert a1 == 'merged'
+        assert len(bases) == 1
+        # Beyond merge radius → added
+        bases, a2 = cluster_update(bases, 5.0, 0.0, merge_r, 6)
+        assert a2 == 'added'
+        assert len(bases) == 2

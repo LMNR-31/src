@@ -19,13 +19,19 @@ Replaces ``pad_waypoint_supervisor`` with a simpler node focused on the
    - if fewer than ``max_bases`` bases exist, add it;
    - otherwise discard (never replace an existing base once 6 are known).
 
+   Multiple bases are discovered and updated concurrently at any time,
+   including while the drone is flying to another target.  The old body-frame
+   jump filter (``max_jump_m``) has been replaced by this world-frame
+   clustering, which is compatible with YOLO switching between bases.
+
 3. Publish ``geometry_msgs/PoseArray`` (2 poses: current + target) on
    ``waypoints_topic`` **only when** the controller reports state == 2.
 
 4. Visiting order: nearest-neighbour from current odom position among
    unvisited bases.  When the drone is within ``reach_tol_m`` (XY) of the
    target, start a ``dwell_s``-second timer.  After dwell, select the next
-   nearest unvisited base.
+   nearest unvisited base.  If no confirmed unvisited base is available after
+   dwell, the FSM falls back to COLLECT to wait for more bases to be confirmed.
 
 5. After all ``max_bases`` bases (or all currently-known bases if fewer;
    see ``require_all_bases`` parameter) have been visited, fly to the home
@@ -47,7 +53,9 @@ reach_tol_m             float    0.10  (XY distance to consider target reached)
 dwell_s                 float    5.0   (seconds to wait at each visited base)
 publish_period_s        float    0.25  (waypoint re-publish interval)
 max_detection_range_m   float    6.0   (reject body-frame detections beyond this)
-max_jump_m              float    2.0   (reject body-frame jump larger than this)
+max_jump_m              float    2.0   (DEPRECATED – no longer applied; kept for
+                                        backward compatibility only; set to 0 to
+                                        silence the deprecation warning at startup)
 require_all_bases       bool     true  (if true, require max_bases before returning home;
                                         if false, return home after all *known* bases visited)
 """
@@ -257,6 +265,8 @@ class BaseWaypointPublisher(Node):
         self.max_detection_range_m: float = float(
             self.get_parameter("max_detection_range_m").value
         )
+        # max_jump_m is kept for backward compatibility but is no longer applied.
+        # World-frame clustering (cluster_update) replaces the body-frame jump filter.
         self.max_jump_m: float = float(self.get_parameter("max_jump_m").value)
         self.require_all_bases: bool = bool(
             self.get_parameter("require_all_bases").value
@@ -277,17 +287,14 @@ class BaseWaypointPublisher(Node):
         self.bases: List[BaseEntry] = []
         self.active_target: Optional[Tuple[float, float]] = None
 
-        # Body-frame anchor for jump filter
-        self._last_det_right: Optional[float] = None
-        self._last_det_front: Optional[float] = None
-
         # FSM
         self.fsm_state: str = "COLLECT"
         self._dwell_start_t: float = 0.0
+        # Guard: ensure DWELL-complete is logged only once per dwell event.
+        self._dwell_completed: bool = False
 
         # Throttle timestamps for warnings
         self._last_range_warn_t: float = -math.inf
-        self._last_jump_warn_t: float = -math.inf
         self._last_det_log_t: float = -math.inf
 
         # ── ROS I/O ───────────────────────────────────────────────────────────
@@ -323,10 +330,15 @@ class BaseWaypointPublisher(Node):
             f"  merge_area_m2={merge_area:.3f}  merge_radius={self.merge_radius:.4f} m\n"
             f"  min_seen_count={self.min_seen_count}\n"
             f"  reach_tol_m={self.reach_tol_m}  dwell_s={self.dwell_s}\n"
-            f"  max_detection_range_m={self.max_detection_range_m}"
-            f"  max_jump_m={self.max_jump_m}\n"
+            f"  max_detection_range_m={self.max_detection_range_m}\n"
             f"  require_all_bases={self.require_all_bases}"
         )
+        if self.max_jump_m > 0.0:
+            self.get_logger().warn(
+                f"[DEPRECATED] max_jump_m={self.max_jump_m} is set but no longer "
+                "applied. Body-frame jump filtering has been replaced by world-frame "
+                "clustering (cluster_update). Set max_jump_m:=0 to silence this warning."
+            )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -356,7 +368,17 @@ class BaseWaypointPublisher(Node):
         self.state_voo = int(msg.data)
 
     def cb_det(self, msg: PointStamped) -> None:
-        """Accumulate base detections; always update bases while flying."""
+        """Accumulate base detections; always update bases while flying.
+
+        Outlier rejection uses only:
+        - ``max_detection_range_m``: reject detections too far in body frame.
+        - World-frame clustering (``cluster_update``): merge close detections
+          into the same base, add new ones up to ``max_bases``, or discard.
+
+        The old body-frame jump filter (``max_jump_m``) has been removed.
+        It prevented YOLO from discovering/updating bases #2..#6 whenever
+        the detector switched between pads (typical jump ~3 m > 2 m limit).
+        """
         if not self.have_odom:
             return
         if self.fsm_state == "DONE":
@@ -378,25 +400,6 @@ class BaseWaypointPublisher(Node):
                     f"right={right:.2f} front={front:.2f}"
                 )
             return
-
-        # ── Outlier rejection: jump ───────────────────────────────────────────
-        if self._last_det_right is not None:
-            jump = math.hypot(
-                right - self._last_det_right, front - self._last_det_front
-            )
-            if self.max_jump_m > 0.0 and jump > self.max_jump_m:
-                now = time.monotonic()
-                if now - self._last_jump_warn_t >= 1.0:
-                    self._last_jump_warn_t = now
-                    self.get_logger().warn(
-                        f"[det] REJECTED jump={jump:.2f} m > "
-                        f"max={self.max_jump_m:.2f} m  "
-                        f"right={right:.2f} front={front:.2f}"
-                    )
-                return
-
-        self._last_det_right = right
-        self._last_det_front = front
 
         # Project body frame → world frame
         wx, wy = body_to_world(front, right, self.cur_x, self.cur_y, self.cur_yaw)
@@ -537,6 +540,7 @@ class BaseWaypointPublisher(Node):
                 )
                 self._mark_active_visited()
                 self._dwell_start_t = time.monotonic()
+                self._dwell_completed = False
                 self.fsm_state = "DWELL"
             else:
                 self._publish_waypoint(tx, ty)
@@ -544,9 +548,11 @@ class BaseWaypointPublisher(Node):
         elif self.fsm_state == "DWELL":
             elapsed = time.monotonic() - self._dwell_start_t
             if elapsed >= self.dwell_s:
-                self.get_logger().info(
-                    f"[DWELL] Dwell complete ({elapsed:.1f} s)."
-                )
+                if not self._dwell_completed:
+                    self._dwell_completed = True
+                    self.get_logger().info(
+                        f"[DWELL] Dwell complete ({elapsed:.1f} s)."
+                    )
                 if self._all_bases_visited():
                     self.get_logger().info(
                         "[MISSION] All bases visited. Returning home "
@@ -558,7 +564,13 @@ class BaseWaypointPublisher(Node):
                 else:
                     next_t = self._pick_nearest_unvisited()
                     if next_t is None:
-                        # No confirmed unvisited base available yet; stay quiet
+                        # No confirmed unvisited base yet; fall back to COLLECT
+                        # to wait for more bases to be confirmed (avoids DWELL spam).
+                        self.get_logger().info(
+                            "[COLLECT] No confirmed unvisited base after dwell; "
+                            "waiting for more bases to be discovered."
+                        )
+                        self.fsm_state = "COLLECT"
                         return
                     self.active_target = next_t
                     self.get_logger().info(
