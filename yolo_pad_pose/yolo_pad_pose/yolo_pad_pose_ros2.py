@@ -1,3 +1,6 @@
+import math
+import time
+
 import rclpy
 from rclpy.node import Node
 
@@ -13,6 +16,18 @@ from ultralytics import YOLO
 
 import tf2_ros
 from tf2_geometry_msgs import do_transform_point
+
+
+def range_filter_check(right: float, front: float, max_range_m: float) -> bool:
+    """Return True if the detection passes the range filter (safe to publish).
+
+    The filter is disabled when *max_range_m* is ``<= 0``, in which case
+    ``True`` is always returned.  Otherwise ``True`` is returned only when
+    ``hypot(right, front) <= max_range_m``.
+    """
+    if max_range_m <= 0.0:
+        return True
+    return math.hypot(right, front) <= max_range_m
 
 
 def robust_depth_m(depth_m: np.ndarray, u: int, v: int, win: int = 7) -> float:
@@ -43,6 +58,10 @@ class YoloPadPose(Node):
         self.declare_parameter("h_class_id", 1)      # YOLO class id for H marker
         self.declare_parameter("target_frame", "uav1/base_link")
         self.declare_parameter("fixed_z", 1.5)
+        # Range filters: detections beyond these body-frame distances are not
+        # published.  Set to 0.0 (or any non-positive value) to disable.
+        self.declare_parameter("max_base_range_m", 6.0)
+        self.declare_parameter("max_h_range_m", 6.0)
 
         # Topics (from your system)
         self.declare_parameter("front_rgb",  "/uav1/rgbd_front/color/image_raw")
@@ -114,6 +133,10 @@ class YoloPadPose(Node):
             f"/landing_pad/h_relative_position (class {self.h_class_id}). "
             "Legacy /landing_pad/relative_position mirrors base topic."
         )
+
+        # Throttle state for range-rejection warnings (one per class, at most 1 Hz).
+        self._base_range_warn_t: float = -float('inf')
+        self._h_range_warn_t: float = -float('inf')
 
     def _detection_to_base_link(
         self,
@@ -213,6 +236,10 @@ class YoloPadPose(Node):
             if cls not in best_by_class or conf_val > best_by_class[cls][0]:
                 best_by_class[cls] = (conf_val, x1, y1, x2, y2)
 
+        # Read range-limit parameters once per callback (supports ros2 param set).
+        max_base_range_m = float(self.get_parameter("max_base_range_m").value)
+        max_h_range_m = float(self.get_parameter("max_h_range_m").value)
+
         # Process base detection (class base_class_id)
         if self.base_class_id in best_by_class:
             conf_val, x1, y1, x2, y2 = best_by_class[self.base_class_id]
@@ -223,17 +250,31 @@ class YoloPadPose(Node):
             )
             if result is not None:
                 out_base, Z = result
-                self.pub_base.publish(out_base)
-                self.pub.publish(out_base)   # backward-compatible alias
-                if source == "front":
-                    self.pub_front.publish(out_base)
-                elif source == "down":
-                    self.pub_down.publish(out_base)
-                self.get_logger().info(
-                    f"[{source}] BASE conf={conf_val:.2f} "
-                    f"right(x)={out_base.point.x:.2f}m "
-                    f"front(y)={out_base.point.y:.2f}m depthZ={Z:.2f}m"
-                )
+                right = out_base.point.x
+                front = out_base.point.y
+                if not range_filter_check(right, front, max_base_range_m):
+                    _now = time.monotonic()
+                    if _now - self._base_range_warn_t >= 1.0:
+                        _range = math.hypot(right, front)
+                        self.get_logger().warning(
+                            f"[{source}] BASE range={_range:.2f}m > "
+                            f"max={max_base_range_m:.2f}m "
+                            f"right={right:.2f} front={front:.2f} "
+                            f"conf={conf_val:.2f} — not published"
+                        )
+                        self._base_range_warn_t = _now
+                else:
+                    self.pub_base.publish(out_base)
+                    self.pub.publish(out_base)   # backward-compatible alias
+                    if source == "front":
+                        self.pub_front.publish(out_base)
+                    elif source == "down":
+                        self.pub_down.publish(out_base)
+                    self.get_logger().info(
+                        f"[{source}] BASE conf={conf_val:.2f} "
+                        f"right(x)={out_base.point.x:.2f}m "
+                        f"front(y)={out_base.point.y:.2f}m depthZ={Z:.2f}m"
+                    )
 
         # Process H detection (class h_class_id)
         if self.h_class_id in best_by_class:
@@ -245,12 +286,26 @@ class YoloPadPose(Node):
             )
             if result is not None:
                 out_h, Z = result
-                self.pub_h.publish(out_h)
-                self.get_logger().info(
-                    f"[{source}] H conf={conf_val:.2f} "
-                    f"right(x)={out_h.point.x:.2f}m "
-                    f"front(y)={out_h.point.y:.2f}m depthZ={Z:.2f}m"
-                )
+                right = out_h.point.x
+                front = out_h.point.y
+                if not range_filter_check(right, front, max_h_range_m):
+                    _now = time.monotonic()
+                    if _now - self._h_range_warn_t >= 1.0:
+                        _range = math.hypot(right, front)
+                        self.get_logger().warning(
+                            f"[{source}] H range={_range:.2f}m > "
+                            f"max={max_h_range_m:.2f}m "
+                            f"right={right:.2f} front={front:.2f} "
+                            f"conf={conf_val:.2f} — not published"
+                        )
+                        self._h_range_warn_t = _now
+                else:
+                    self.pub_h.publish(out_h)
+                    self.get_logger().info(
+                        f"[{source}] H conf={conf_val:.2f} "
+                        f"right(x)={out_h.point.x:.2f}m "
+                        f"front(y)={out_h.point.y:.2f}m depthZ={Z:.2f}m"
+                    )
 
 
 def main():

@@ -5,6 +5,40 @@ waypoint supervisor.
 
 ---
 
+## yolo_pad_pose (detector node)
+
+### Range filter parameters
+
+To prevent high-confidence false positives at long range from being published
+(and subsequently spamming downstream nodes with rejection warnings), the node
+supports configurable body-frame range limits.
+
+| Parameter          | Type  | Default | Description |
+|--------------------|-------|---------|-------------|
+| `max_base_range_m` | float | `6.0`   | Maximum body-frame range `hypot(right, front)` for **base** detections. Detections beyond this value are not published to `/landing_pad/base_relative_position` (nor the legacy alias `/landing_pad/relative_position`). Set to `0.0` to disable. |
+| `max_h_range_m`    | float | `6.0`   | Maximum body-frame range for **H-marker** detections. Detections beyond this value are not published to `/landing_pad/h_relative_position`. Set to `0.0` to disable. |
+
+When a detection is suppressed by the range filter, a throttled warning (at
+most 1 Hz per class) is logged showing the measured range, the limit, and the
+detection confidence.
+
+Example — suppress base detections beyond 4.0 m (eliminates the observed
+~4.75 m false positives):
+
+```bash
+ros2 run yolo_pad_pose yolo_pad_pose --ros-args \
+  -p max_base_range_m:=4.0
+```
+
+These parameters can also be changed at runtime:
+
+```bash
+ros2 param set /yolo_pad_pose max_base_range_m 4.0
+ros2 param set /yolo_pad_pose max_h_range_m 4.0
+```
+
+---
+
 ## pad_waypoint_supervisor
 
 ### Detection convention and coordinate projection
