@@ -186,6 +186,9 @@ ros2 run drone_control pouso --ros-args \
 | `h_timeout_s` | `0.75` | Max age (s) for entries in the internal rolling detection window (does not affect the best candidate selected during collection) |
 | `max_h_range_m` | `6.0` | Reject H detections with planar range > this value (m) |
 | `prefer_closest_h` | `true` | Among recent detections pick the one with minimum range; `false` picks the latest |
+| `h_filter_type` | `"none"` | Filter applied to collected right/front samples before computing the landing target: `"none"` (disabled), `"mean"` (moving average), `"median"`. Only active when `use_yolo_h=true` |
+| `h_filter_window` | `5` | Max number of recent samples kept in the filter buffer (≥1). With `window=1` the filter is equivalent to no filtering |
+| `h_filter_min_samples` | `3` | Minimum samples required to apply the filter; falls back to the raw best detection if fewer samples were collected |
 
 ### Topics
 

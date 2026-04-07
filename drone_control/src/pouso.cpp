@@ -30,6 +30,9 @@
 //   h_timeout_s       (double, default  0.75)    — max age (s) of a valid H detection (rolling window)
 //   max_h_range_m     (double, default  6.0)     — max planar range (m) to accept a detection
 //   prefer_closest_h  (bool,   default  true)    — pick H closest to drone; false = latest
+//   h_filter_type     (string, default "none")   — filter applied to collected right/front samples: "none", "mean", "median"
+//   h_filter_window   (int,    default  5)        — max number of samples kept in the filter buffer (≥1)
+//   h_filter_min_samples (int, default  3)        — minimum samples required to apply filter; falls back to best_collected_h_ if fewer
 //
 // Published topics
 //   /waypoints  [geometry_msgs/PoseArray]   — consumed by my_drone_controller
@@ -83,6 +86,9 @@ public:
     this->declare_parameter<double>     ("h_timeout_s",     0.75);
     this->declare_parameter<double>     ("max_h_range_m",   6.0);
     this->declare_parameter<bool>       ("prefer_closest_h", true);
+    this->declare_parameter<std::string>("h_filter_type",        "none");
+    this->declare_parameter<int>        ("h_filter_window",      5);
+    this->declare_parameter<int>        ("h_filter_min_samples", 3);
     this->declare_parameter<double>     ("xy_hold_tol",      0.10);
     this->declare_parameter<double>     ("xy_hold_stable_s", 1.0);
     this->declare_parameter<double>     ("xy_abort_tol",     0.5);
@@ -102,6 +108,9 @@ public:
     h_timeout_s_     = this->get_parameter("h_timeout_s").as_double();
     max_h_range_m_   = this->get_parameter("max_h_range_m").as_double();
     prefer_closest_h_ = this->get_parameter("prefer_closest_h").as_bool();
+    h_filter_type_    = this->get_parameter("h_filter_type").as_string();
+    h_filter_window_  = std::max(1, this->get_parameter("h_filter_window").as_int());
+    h_filter_min_samples_ = std::max(1, this->get_parameter("h_filter_min_samples").as_int());
     xy_hold_tol_      = this->get_parameter("xy_hold_tol").as_double();
     xy_hold_stable_s_ = this->get_parameter("xy_hold_stable_s").as_double();
     xy_abort_tol_     = this->get_parameter("xy_abort_tol").as_double();
@@ -139,13 +148,14 @@ public:
       "pouso node started. uav=%s landing_z=%.2f use_current_xy=%s "
       "target=(%.2f, %.2f) check_after=%.1fs "
       "xy_hold_tol=%.3fm xy_hold_stable_s=%.1fs xy_abort_tol=%.3fm "
-      "approach_z=%s use_yolo_h=%s",
+      "approach_z=%s use_yolo_h=%s h_filter=%s(window=%d,min=%d)",
       uav_name_.c_str(), landing_z_,
       use_current_xy_ ? "true" : "false",
       target_x_, target_y_, check_after_sec_,
       xy_hold_tol_, xy_hold_stable_s_, xy_abort_tol_,
       approach_z_str.c_str(),
-      use_yolo_h_ ? "true" : "false");
+      use_yolo_h_ ? "true" : "false",
+      h_filter_type_.c_str(), h_filter_window_, h_filter_min_samples_);
   }
 
 private:
@@ -188,6 +198,14 @@ private:
       if (!has_best_h_ || range < best_collected_h_.range) {
         best_collected_h_ = {this->now(), right, front, range};
         has_best_h_ = true;
+      }
+      // Populate filter buffer (only when filter is active)
+      if (h_filter_type_ != "none") {
+        h_filter_buffer_.push_back({right, front});
+        // Keep only the last h_filter_window_ samples
+        while (static_cast<int>(h_filter_buffer_.size()) > h_filter_window_) {
+          h_filter_buffer_.erase(h_filter_buffer_.begin());
+        }
       }
     }
 
@@ -236,6 +254,7 @@ private:
           collect_start_    = this->now();
           h_collect_count_  = 0;
           has_best_h_       = false;
+          h_filter_buffer_.clear();
           fsm_ = PousoFSM::COLLECT_H;
         } else {
           startLanding();
@@ -305,22 +324,96 @@ private:
       });
   }
 
+  // Apply h_filter_type_ (mean/median) to h_filter_buffer_.
+  // Returns true and sets right_out/front_out when the filter is active and
+  // there are enough samples; returns false otherwise (caller should fall back
+  // to best_collected_h_).
+  bool applyHFilter(double & right_out, double & front_out)
+  {
+    if (h_filter_type_ == "none") {
+      return false;
+    }
+    if (static_cast<int>(h_filter_buffer_.size()) < h_filter_min_samples_) {
+      return false;
+    }
+
+    if (h_filter_type_ == "mean") {
+      double sum_r = 0.0, sum_f = 0.0;
+      for (const auto & p : h_filter_buffer_) {
+        sum_r += p.first;
+        sum_f += p.second;
+      }
+      right_out = sum_r / static_cast<double>(h_filter_buffer_.size());
+      front_out = sum_f / static_cast<double>(h_filter_buffer_.size());
+      return true;
+    }
+
+    if (h_filter_type_ == "median") {
+      std::vector<double> rs, fs;
+      rs.reserve(h_filter_buffer_.size());
+      fs.reserve(h_filter_buffer_.size());
+      for (const auto & p : h_filter_buffer_) {
+        rs.push_back(p.first);
+        fs.push_back(p.second);
+      }
+      std::sort(rs.begin(), rs.end());
+      std::sort(fs.begin(), fs.end());
+      const size_t n = rs.size();
+      if (n % 2 == 0) {
+        right_out = (rs[n / 2 - 1] + rs[n / 2]) / 2.0;
+        front_out = (fs[n / 2 - 1] + fs[n / 2]) / 2.0;
+      } else {
+        right_out = rs[n / 2];
+        front_out = fs[n / 2];
+      }
+      return true;
+    }
+
+    // Unknown filter type — warn once and treat as "none"
+    RCLCPP_WARN_ONCE(this->get_logger(),
+      "[yolo_h] h_filter_type='%s' desconhecido. Usando sem filtro.",
+      h_filter_type_.c_str());
+    return false;
+  }
+
   // Compute landing target from YOLO-H / odom / params and store in
   // active_land_x_ / active_land_y_.
   void computeLandingTarget()
   {
     if (use_yolo_h_) {
       if (has_best_h_) {
+        double r = best_collected_h_.right;
+        double f = best_collected_h_.front;
+
+        double filtered_r, filtered_f;
+        if (applyHFilter(filtered_r, filtered_f)) {
+          RCLCPP_INFO(this->get_logger(),
+            "[yolo_h] Filtro '%s' aplicado (n=%zu): "
+            "right %.3f→%.3f  front %.3f→%.3f",
+            h_filter_type_.c_str(),
+            h_filter_buffer_.size(),
+            r, filtered_r, f, filtered_f);
+          r = filtered_r;
+          f = filtered_f;
+        } else if (h_filter_type_ != "none") {
+          RCLCPP_DEBUG(this->get_logger(),
+            "[yolo_h] Filtro '%s': amostras insuficientes (%zu < %d). "
+            "Usando best_collected_h_ diretamente.",
+            h_filter_type_.c_str(),
+            h_filter_buffer_.size(),
+            h_filter_min_samples_);
+        }
+
         double yaw = current_yaw_;
-        double dx  = std::cos(yaw) * best_collected_h_.front + std::sin(yaw) * best_collected_h_.right;
-        double dy  = std::sin(yaw) * best_collected_h_.front - std::cos(yaw) * best_collected_h_.right;
+        double dx  = std::cos(yaw) * f + std::sin(yaw) * r;
+        double dy  = std::sin(yaw) * f - std::cos(yaw) * r;
         active_land_x_ = current_x_ + dx;
         active_land_y_ = current_y_ + dy;
         RCLCPP_INFO(this->get_logger(),
           "[yolo_h] Alvo YOLO-H: XY=(%.2f, %.2f) | right=%.2f front=%.2f "
           "range=%.2f yaw=%.3frad",
           active_land_x_, active_land_y_,
-          best_collected_h_.right, best_collected_h_.front,
+          r, f,
           best_collected_h_.range, yaw);
       } else {
         RCLCPP_WARN(this->get_logger(),
@@ -519,6 +612,7 @@ private:
   double approach_z_    {0.0};  // hover altitude for CENTER phase (set in startLanding())
 
   std::vector<HDetection> h_detections_;
+  std::vector<std::pair<double, double>> h_filter_buffer_;  // (right, front) samples for filter
 
   rclcpp::Time attempt_start_;
   rclcpp::Time collect_start_;
@@ -546,6 +640,9 @@ private:
   double      h_timeout_s_;
   double      max_h_range_m_;
   bool        prefer_closest_h_;
+  std::string h_filter_type_;
+  int         h_filter_window_;
+  int         h_filter_min_samples_;
 };
 
 int main(int argc, char ** argv)

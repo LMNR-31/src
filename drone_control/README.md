@@ -123,6 +123,9 @@ ros2 run drone_control pouso --ros-args \
 | `h_timeout_s`     | `0.75`  | Max age (s) for H detection window entries |
 | `max_h_range_m`   | `6.0`   | Max range (m) to accept a YOLO H detection |
 | `prefer_closest_h`| `true`  | Select H closest to drone; `false` = latest |
+| `h_filter_type`   | `"none"`| Filter applied to collected right/front samples: `"none"`, `"mean"`, `"median"` |
+| `h_filter_window` | `5`     | Max number of recent samples kept in the filter buffer (≥1) |
+| `h_filter_min_samples` | `3` | Minimum samples required to apply the filter; falls back to `best_collected_h_` if fewer |
 
 **Log messages to expect:**
 
@@ -134,6 +137,8 @@ ros2 run drone_control pouso --ros-args \
 | `⬇️  DESCEND: Z=…` | Periodic status during descent |
 | `⚠️  Deriva excessiva durante descida: dxy=… > xy_abort_tol=…` | Aborting descent; returning to CENTER |
 | `✅ Pouso concluído: …` | Landing complete; node exits |
+| `[yolo_h] Filtro 'mean'/'median' aplicado (n=N): right X→Y  front X→Y` | Filter was applied; shows raw vs filtered values |
+| `[yolo_h] Filtro '…': amostras insuficientes (N < M). Usando best_collected_h_…` | Not enough samples; fell back to best detection (DEBUG level) |
 
 ### `takeoff`
 
