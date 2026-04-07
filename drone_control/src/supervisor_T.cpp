@@ -626,18 +626,38 @@ private:
     pid_t fork_exec_pouso_local() {
         // Build parameter strings on the stack before fork() so the child
         // process inherits valid copies via the copy-on-write page tables.
+        // 64 bytes is more than sufficient for any representable double value
+        // (e.g. "xy_hold_stable_s:=-1234.5678" ≈ 29 chars), but we verify
+        // snprintf succeeded to catch unexpected truncation in future edits.
         char xy_hold_tol_arg[64];
         char xy_hold_stable_s_arg[64];
         char xy_abort_tol_arg[64];
         char approach_z_arg[64];
-        snprintf(xy_hold_tol_arg,      sizeof(xy_hold_tol_arg),
-                 "xy_hold_tol:=%.4f",       pouso_xy_hold_tol_);
-        snprintf(xy_hold_stable_s_arg, sizeof(xy_hold_stable_s_arg),
-                 "xy_hold_stable_s:=%.4f",  pouso_xy_hold_stable_s_);
-        snprintf(xy_abort_tol_arg,     sizeof(xy_abort_tol_arg),
-                 "xy_abort_tol:=%.4f",      pouso_xy_abort_tol_);
-        snprintf(approach_z_arg,       sizeof(approach_z_arg),
-                 "approach_z:=%.4f",        pouso_approach_z_);
+        const int r1 = snprintf(xy_hold_tol_arg,      sizeof(xy_hold_tol_arg),
+                                "xy_hold_tol:=%.4f",       pouso_xy_hold_tol_);
+        const int r2 = snprintf(xy_hold_stable_s_arg, sizeof(xy_hold_stable_s_arg),
+                                "xy_hold_stable_s:=%.4f",  pouso_xy_hold_stable_s_);
+        const int r3 = snprintf(xy_abort_tol_arg,     sizeof(xy_abort_tol_arg),
+                                "xy_abort_tol:=%.4f",      pouso_xy_abort_tol_);
+        const int r4 = snprintf(approach_z_arg,       sizeof(approach_z_arg),
+                                "approach_z:=%.4f",        pouso_approach_z_);
+
+        if (r1 < 0 || r1 >= static_cast<int>(sizeof(xy_hold_tol_arg)) ||
+            r2 < 0 || r2 >= static_cast<int>(sizeof(xy_hold_stable_s_arg)) ||
+            r3 < 0 || r3 >= static_cast<int>(sizeof(xy_abort_tol_arg)) ||
+            r4 < 0 || r4 >= static_cast<int>(sizeof(approach_z_arg))) {
+            RCLCPP_WARN(this->get_logger(),
+                "[fork_exec_pouso_local] snprintf falhou ou truncou argumento de "
+                "parâmetro — sobrescrevendo com valores padrão seguros.");
+            snprintf(xy_hold_tol_arg,      sizeof(xy_hold_tol_arg),
+                     "xy_hold_tol:=0.1000");
+            snprintf(xy_hold_stable_s_arg, sizeof(xy_hold_stable_s_arg),
+                     "xy_hold_stable_s:=1.0000");
+            snprintf(xy_abort_tol_arg,     sizeof(xy_abort_tol_arg),
+                     "xy_abort_tol:=0.5000");
+            snprintf(approach_z_arg,       sizeof(approach_z_arg),
+                     "approach_z:=-1.0000");
+        }
 
         pid_t pid = fork();
         if (pid == 0) {

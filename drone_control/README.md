@@ -243,6 +243,7 @@ manually:
 
    Expected:
    - `🏠 UAV entrou na zona base (dist=0.071 m ≤ tol=0.20 m). Aguardando estabilidade de 2.0 s…`
+     (dist is `hypot(0.05, 0.05) ≈ 0.07071 m`, printed as `0.071` by the `%.3f` format)
    - After `wait_after_traj_done_s` elapses: `🏠 UAV na zona base (dist=0.071 m). Estabilidade: X.X s / 2.0 s…`
    - After 2 s stability: `🏠 UAV na zona base há 2.X s … — pouso local autorizado.`
    - Then: `⏱️  5.0 s concluídos. UAV no ponto base (x=0.05 y=0.05) — lançando pouso com posição local (xy_hold_tol=0.10, …)…`
