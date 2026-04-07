@@ -24,6 +24,7 @@
 //   xy_hold_stable_s  (double, default  1.0)     — seconds to remain within xy_hold_tol before descending
 //   xy_abort_tol      (double, default  0.5)     — abort descent and recenter if dxy exceeds this (m)
 //   approach_z        (double, default -1.0)     — hover altitude for CENTER phase (m); -1 = current odom Z
+//   max_approach_z    (double, default  3.5)     — maximum allowed approach altitude (m); approach_z is clamped to this
 //   use_yolo_h        (bool,   default  false)   — use YOLO H detection for landing XY
 //   h_topic           (string, default "/landing_pad/h_relative_position") — YOLO H topic
 //   h_collect_time_s  (double, default  1.0)     — seconds to hover and collect H detections before choosing best
@@ -87,6 +88,7 @@ public:
     this->declare_parameter<double>     ("xy_hold_stable_s", 1.0);
     this->declare_parameter<double>     ("xy_abort_tol",     0.5);
     this->declare_parameter<double>     ("approach_z",      -1.0);
+    this->declare_parameter<double>     ("max_approach_z",   3.5);
 
     uav_name_        = this->get_parameter("uav_name").as_string();
     target_x_        = this->get_parameter("x").as_double();
@@ -106,6 +108,7 @@ public:
     xy_hold_stable_s_ = this->get_parameter("xy_hold_stable_s").as_double();
     xy_abort_tol_     = this->get_parameter("xy_abort_tol").as_double();
     approach_z_param_ = this->get_parameter("approach_z").as_double();
+    max_approach_z_   = this->get_parameter("max_approach_z").as_double();
 
     // ── publisher / subscribers ──────────────────────────────────────────────
     waypoints_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>("/waypoints", 10);
@@ -139,12 +142,12 @@ public:
       "pouso node started. uav=%s landing_z=%.2f use_current_xy=%s "
       "target=(%.2f, %.2f) check_after=%.1fs "
       "xy_hold_tol=%.3fm xy_hold_stable_s=%.1fs xy_abort_tol=%.3fm "
-      "approach_z=%s use_yolo_h=%s",
+      "approach_z=%s max_approach_z=%.2fm use_yolo_h=%s",
       uav_name_.c_str(), landing_z_,
       use_current_xy_ ? "true" : "false",
       target_x_, target_y_, check_after_sec_,
       xy_hold_tol_, xy_hold_stable_s_, xy_abort_tol_,
-      approach_z_str.c_str(),
+      approach_z_str.c_str(), max_approach_z_,
       use_yolo_h_ ? "true" : "false");
   }
 
@@ -344,6 +347,14 @@ private:
     // Determine approach altitude: use param if set, else use current odom Z.
     approach_z_ = (approach_z_param_ >= 0.0) ? approach_z_param_ : current_z_;
 
+    // Clamp to maximum allowed approach altitude.
+    if (approach_z_ > max_approach_z_) {
+      RCLCPP_WARN(this->get_logger(),
+        "approach_z_ %.2f m exceeds max_approach_z_ %.2f m — clamping.",
+        approach_z_, max_approach_z_);
+      approach_z_ = max_approach_z_;
+    }
+
     const char * fonte;
     if (use_yolo_h_ && has_best_h_) {
       fonte = "yolo-H";
@@ -540,6 +551,7 @@ private:
   double      xy_hold_stable_s_;
   double      xy_abort_tol_;
   double      approach_z_param_;  // raw param; <0 means "use current odom Z"
+  double      max_approach_z_;    // upper bound for approach_z_ (m)
   bool        use_yolo_h_;
   std::string h_topic_;
   double      h_collect_time_s_;
