@@ -5,6 +5,84 @@ waypoint supervisor.
 
 ---
 
+## pad_waypoint_nn (`base_waypoint_publisher`)
+
+Nearest-neighbour landing-pad base waypoint publisher.  Builds a list of up
+to **6** landing-pad bases from YOLO detections, visits them in nearest-neighbour
+order, dwells at each for 5 seconds, and finally returns to the takeoff origin.
+
+### Quick start
+
+```bash
+ros2 run yolo_pad_pose pad_waypoint_nn --ros-args \
+  -p z_fixed:=1.75 \
+  -p dwell_s:=5.0 \
+  -p max_bases:=6
+```
+
+### Parameters
+
+| Parameter                 | Type   | Default                               | Description |
+|---------------------------|--------|---------------------------------------|-------------|
+| `odom_topic`              | string | `/uav1/mavros/local_position/odom`    | Odometry input topic. |
+| `det_topic`               | string | `/landing_pad/base_relative_position` | YOLO base detection topic (`PointStamped`; `point.x`=right, `point.y`=front). |
+| `waypoints_topic`         | string | `/waypoints`                          | Output `PoseArray` waypoint topic (2 poses: current + target). |
+| `controller_state_topic`  | string | `/drone_controller/state_voo`         | Controller state topic; waypoints published only when state == 2. |
+| `world_frame_id`          | string | `map`                                 | Frame id of published waypoints. Auto-overridden from first odom `header.frame_id` when left as `"map"`. |
+| `z_fixed`                 | float  | `1.75`                                | Fixed waypoint altitude (m). |
+| `max_bases`               | int    | `6`                                   | Maximum number of bases to track and visit. |
+| `merge_area_m2`           | float  | `2.25`                                | Merge circular area (m²). Merge radius = `sqrt(area/π)` ≈ **0.846 m** for the default 2.25 m². |
+| `min_seen_count`          | int    | `3`                                   | Minimum detections before a base is considered confirmed for visiting. |
+| `reach_tol_m`             | float  | `0.10`                                | XY distance (m) to consider a target reached. |
+| `dwell_s`                 | float  | `5.0`                                 | Seconds to wait at each visited base before selecting the next. |
+| `publish_period_s`        | float  | `0.25`                                | Waypoint re-publish interval (s). |
+| `max_detection_range_m`   | float  | `6.0`                                 | Reject body-frame detections beyond this range (m). Set `0` to disable. |
+| `max_jump_m`              | float  | `2.0`                                 | Reject body-frame detections that jump more than this between callbacks (m). |
+| `require_all_bases`       | bool   | `true`                                | If `true`, return home only after `max_bases` bases are visited. If `false`, return home after all *currently known* confirmed bases are visited. |
+
+### Merge radius derivation
+
+The merge area parameter (`merge_area_m2`, default 2.25 m²) is interpreted as
+the area of a circle whose radius defines the merge boundary:
+
+```
+merge_radius_m = sqrt(merge_area_m2 / pi)
+               = sqrt(2.25 / pi)
+               ≈ 0.846 m
+```
+
+Any new detection whose world-frame position falls within this radius of an
+existing base is merged into that base via EMA (α = 0.3) rather than creating
+a new entry.
+
+### Coordinate projection (body → world)
+
+Detections from `yolo_pad_pose` use the convention:
+`point.x` = right (+starboard), `point.y` = front (+nose).
+
+The projection to world frame (ENU) given odom yaw θ is:
+
+```
+wx = cur_x + front*cos(θ) + right*sin(θ)
+wy = cur_y + front*sin(θ) - right*cos(θ)
+```
+
+### FSM states
+
+```
+COLLECT → NAVIGATE → DWELL → NAVIGATE → … → RETURN_HOME → DONE
+```
+
+- **COLLECT**: collecting detections; transitions to NAVIGATE once at least
+  one confirmed base is available and `state_voo == 2`.
+- **NAVIGATE**: flying to the nearest unvisited confirmed base; publishes
+  waypoints every `publish_period_s`.
+- **DWELL**: reached target; waits `dwell_s` before selecting next base.
+- **RETURN_HOME**: all bases visited; flying back to origin.
+- **DONE**: within `reach_tol_m` of home; node goes quiet.
+
+---
+
 ## yolo_pad_pose (detector node)
 
 ### Range filter parameters
