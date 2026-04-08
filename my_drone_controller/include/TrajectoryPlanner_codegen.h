@@ -19,7 +19,7 @@ public:
     std::vector<double> segmentTimes;
     
     coder::array<double, 3U> coefficients; // Matriz de coeficientes do polinômio
-    double numSegments;
+    int numSegments;
     double X_final[3];
     double hoverTime[4];
     boolean_T inHover;
