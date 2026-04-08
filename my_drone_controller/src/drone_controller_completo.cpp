@@ -2430,8 +2430,11 @@ void DroneControllerCompleto::handle_state3_trajectory()
     double yaw_follow = compute_yaw_for_trajectory_waypoint(
       std::min(current_waypoint_idx_, static_cast<int>(last_idx)), at_last_wp);
 
-    // Publish: position from planner + XY velocity feedforward from planner
-    // + Z velocity from position controller + yaw.
+    // Publish position + velocity + yaw setpoint.
+    // Design: XY velocity uses planner feedforward (Vd[0], Vd[1]) so PX4 can
+    // anticipate and smoothly track the continuous trajectory.  Z velocity uses
+    // drone_ctrl_.zdot_des (from the PID position controller) so altitude error
+    // is actively corrected independently of the planner's Z feedforward.
     publishPositionTargetWithVelocityAndYaw(
       Xd[0], Xd[1], Xd[2],
       Vd[0], Vd[1], drone_ctrl_.zdot_des,
