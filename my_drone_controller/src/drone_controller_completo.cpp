@@ -316,6 +316,9 @@ void DroneControllerCompleto::init_variables()
   current_x_ned_ = 0.0;
   current_y_ned_ = 0.0;
   current_z_ned_ = 0.0;
+  current_vx_ned_ = 0.0;
+  current_vy_ned_ = 0.0;
+  current_vz_ned_ = 0.0;
   has_latch_pose_ = false;
   yaw_override_enabled_ = false;
   yaw_rate_cmd_ = 0.0;
@@ -335,6 +338,7 @@ void DroneControllerCompleto::init_variables()
   post_offboard_stream_done_ = false;
   setpoint_pub_time_initialized_ = false;
   mission_enabled_ = false;
+  planner_initialized_ = false;
 }
 
 // ============================================================
@@ -567,6 +571,9 @@ void DroneControllerCompleto::odometry_callback(const nav_msgs::msg::Odometry::S
   current_y_ned_ = msg->pose.pose.position.y;
   current_z_ned_ = msg->pose.pose.position.z;
   current_z_real_ = std::abs(current_z_ned_);
+  current_vx_ned_ = msg->twist.twist.linear.x;
+  current_vy_ned_ = msg->twist.twist.linear.y;
+  current_vz_ned_ = msg->twist.twist.linear.z;
   const auto & q = msg->pose.pose.orientation;
   current_yaw_rad_ = std::atan2(
     2.0 * (q.w * q.z + q.x * q.y),
@@ -1557,6 +1564,29 @@ void DroneControllerCompleto::publishPositionTargetWithYaw(
   setpoint_pub_time_initialized_ = true;
 }
 
+void DroneControllerCompleto::publishPositionTargetWithVelocityAndYaw(
+  double x, double y, double z,
+  double vx, double vy, double vz,
+  double yaw_rad)
+{
+  mavros_msgs::msg::PositionTarget pt;
+  pt.header.stamp = this->now();
+  pt.header.frame_id = "map";
+  pt.coordinate_frame = mavros_msgs::msg::PositionTarget::FRAME_LOCAL_NED;
+  pt.type_mask = MASK_POS_VEL_YAW;
+  pt.position.x = static_cast<float>(x);
+  pt.position.y = static_cast<float>(y);
+  pt.position.z = static_cast<float>(z);
+  pt.velocity.x = static_cast<float>(vx);
+  pt.velocity.y = static_cast<float>(vy);
+  pt.velocity.z = static_cast<float>(vz);
+  pt.yaw = static_cast<float>(yaw_rad);
+  raw_pub_->publish(pt);
+  // Watchdog: record time of last real publish
+  last_setpoint_pub_time_ = pt.header.stamp;
+  setpoint_pub_time_initialized_ = true;
+}
+
 // ============================================================
 // WATCHDOG HOLD SETPOINT
 // ============================================================
@@ -2127,10 +2157,45 @@ bool DroneControllerCompleto::initialize_trajectory()
   trajectory_start_time_ = this->now();
   trajectory_started_ = true;
   current_waypoint_idx_ = 0;
+  planner_initialized_ = false;
 
   RCLCPP_INFO(this->get_logger(),
     "✈️ Trajetória iniciada! %zu waypoints | %.1f segundos cada",
     trajectory_waypoints_.size(), waypoint_duration_);
+
+  // ── Initialize TrajectoryPlanner_codegen and Drone_codegen ───────────────
+  int n = static_cast<int>(trajectory_waypoints_.size()) - 1;
+  if (n >= 1) {
+    // Build flat waypoints vector: [X0..Xn, Y0..Yn, Z0..Zn]
+    planner_.waypoints.resize(3 * (n + 1));
+    for (int i = 0; i <= n; ++i) {
+      planner_.waypoints[i]               = trajectory_waypoints_[i].position.x;
+      planner_.waypoints[(n + 1) + i]     = trajectory_waypoints_[i].position.y;
+      planner_.waypoints[2 * (n + 1) + i] = trajectory_waypoints_[i].position.z;
+    }
+    planner_.segmentTimes.assign(static_cast<size_t>(n), waypoint_duration_);
+    planner_.numSegments = n;
+    planner_.init();
+
+    drone_ctrl_.init();
+    planner_initialized_ = true;
+
+    RCLCPP_INFO(this->get_logger(),
+      "🚀 [PLANNER] TrajectoryPlanner_codegen inicializado: %d segmentos, %.1f s/segmento",
+      n, waypoint_duration_);
+    RCLCPP_INFO(this->get_logger(),
+      "🎮 [CTRL] Drone_codegen inicializado. Controle de posição contínuo ativo.");
+    for (int i = 0; i <= n; ++i) {
+      RCLCPP_INFO(this->get_logger(),
+        "   WP[%d]: X=%.2f  Y=%.2f  Z=%.2f",
+        i, trajectory_waypoints_[i].position.x,
+        trajectory_waypoints_[i].position.y,
+        trajectory_waypoints_[i].position.z);
+    }
+  } else {
+    RCLCPP_WARN(this->get_logger(),
+      "⚠️ [PLANNER] Trajetória tem apenas 1 waypoint — usando setpoint de posição simples.");
+  }
 
   // Publish the first waypoint as the active goal for monitoring.
   const auto & first_wp = trajectory_waypoints_[0];
@@ -2340,8 +2405,47 @@ void DroneControllerCompleto::handle_state3_trajectory()
     return;
   }
 
-  // Publish current waypoint setpoint (hold until reach condition fires).
-  publish_trajectory_waypoint_setpoint(current_waypoint_idx_);
+  // ── Trajectory setpoint publishing ───────────────────────────────────────
+  // When the planner is initialized (multi-segment trajectory), use
+  // TrajectoryPlanner_codegen for continuous (Xd, Vd, Ad) and Drone_codegen
+  // for the Z-velocity command.  Otherwise fall back to position-only setpoints.
+  if (planner_initialized_) {
+    double elapsed = (this->now() - trajectory_start_time_).seconds();
+
+    double Xd[3], Vd[3], Ad[3];
+    planner_.getNextSetpoint(elapsed, Xd, Vd, Ad);
+
+    // Feed current odometry into the position controller.
+    drone_ctrl_.r[0]  = current_x_ned_;
+    drone_ctrl_.r[1]  = current_y_ned_;
+    drone_ctrl_.r[2]  = current_z_ned_;
+    drone_ctrl_.dr[0] = current_vx_ned_;
+    drone_ctrl_.dr[1] = current_vy_ned_;
+    drone_ctrl_.dr[2] = current_vz_ned_;
+    drone_ctrl_.PositionCtrl(Xd, Vd, Ad);
+
+    // Compute yaw toward the current target waypoint using existing logic.
+    size_t last_idx = trajectory_waypoints_.size() - 1;
+    bool at_last_wp = (static_cast<size_t>(current_waypoint_idx_) == last_idx);
+    double yaw_follow = compute_yaw_for_trajectory_waypoint(
+      std::min(current_waypoint_idx_, static_cast<int>(last_idx)), at_last_wp);
+
+    // Publish: position from planner + XY velocity feedforward from planner
+    // + Z velocity from position controller + yaw.
+    publishPositionTargetWithVelocityAndYaw(
+      Xd[0], Xd[1], Xd[2],
+      Vd[0], Vd[1], drone_ctrl_.zdot_des,
+      yaw_follow);
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+      "🛸 [PLANNER] t=%.2fs seg=%d/%d | "
+      "Xd=(%.2f,%.2f,%.2f) Vd=(%.2f,%.2f) zdot_des=%.2f",
+      elapsed, current_waypoint_idx_, planner_.numSegments,
+      Xd[0], Xd[1], Xd[2], Vd[0], Vd[1], drone_ctrl_.zdot_des);
+  } else {
+    // Single-waypoint fallback: publish position setpoint as before.
+    publish_trajectory_waypoint_setpoint(current_waypoint_idx_);
+  }
   log_trajectory_progress(current_waypoint_idx_);
 
   // Detect waypoint reach by position and publish /waypoint_reached (once per index).

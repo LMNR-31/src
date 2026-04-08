@@ -20,6 +20,8 @@
 #include "drone_config.h"
 #include "my_drone_controller/command_queue.hpp"
 #include "my_drone_controller/waypoint_validation.hpp"
+#include "TrajectoryPlanner_codegen.h"
+#include "Drone_codegen.h"
 
 #include <mutex>
 #include <optional>
@@ -82,6 +84,10 @@ public:
 
   // Position only; ignore velocity, acceleration, yaw angle and yaw_rate
   static constexpr uint16_t MASK_POS_ONLY = MASK_POS_YAWRATE | IGNORE_YAW_RATE;
+
+  // Position + velocity + absolute yaw; ignore acceleration and yaw_rate
+  static constexpr uint16_t MASK_POS_VEL_YAW =
+    IGNORE_AFX | IGNORE_AFY | IGNORE_AFZ | IGNORE_YAW_RATE;
 
   /// Watchdog: minimum guaranteed setpoint publish rate (Hz).
   static constexpr double MIN_SETPOINT_RATE_HZ = 20.0;
@@ -215,6 +221,10 @@ private:
   void publishPositionTarget(double x, double y, double z,
                              double yaw_rate, uint16_t type_mask);
   void publishPositionTargetWithYaw(double x, double y, double z, double yaw_rad);
+  void publishPositionTargetWithVelocityAndYaw(
+    double x, double y, double z,
+    double vx, double vy, double vz,
+    double yaw_rad);
   /// Publish a hold setpoint using hold_* if valid, otherwise current_*_ned_.
   void publish_hold_setpoint();
   /// Publish x, y, z as the current active goal to /waypoint_goal (with self-echo guard).
@@ -389,6 +399,9 @@ private:
   double current_x_ned_;
   double current_y_ned_;
   double current_z_ned_;
+  double current_vx_ned_;
+  double current_vy_ned_;
+  double current_vz_ned_;
   double final_waypoint_yaw_{0.0};
   bool at_last_waypoint_yaw_fixed_{false};
 
@@ -408,6 +421,11 @@ private:
   bool using_4d_goal_;
   bool trajectory_4d_mode_;
   std::vector<double> trajectory_yaws_;
+
+  // ── Trajectory planner and position controller (codegen) ─────────────────
+  TrajectoryPlanner_codegen planner_;
+  Drone_codegen drone_ctrl_;
+  bool planner_initialized_;
 
   // ── Control flags ────────────────────────────────────────────────────────
   bool enabled_{true};
