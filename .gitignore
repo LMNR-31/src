@@ -6,3 +6,4 @@ drone_custom_control/drone_custom_control/nodes/__pycache__/
 drone_custom_control/test/__pycache__/
 **/__pycache__/
 *.pyc
+*.o
