@@ -124,7 +124,7 @@ windows:
           source ~/ros2_ws/install/setup.bash
           source /home/lmnr31/venvs/yolo/bin/activate
           python3 -m yolo_pad_pose.yolo_pad_pose_ros2 --ros-args \
-            -p model_path:=/home/lmnr31/runs/detect/train7/weights/best.pt \
+            -p model_path:=/home/lmnr31/ros2_ws/src/models/landing_pad_yolo/best.pt \
             -p conf:=0.7 \
             -p max_base_range_m:=4.0 \
             -p max_h_range_m:=4.0
