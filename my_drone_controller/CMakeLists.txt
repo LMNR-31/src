@@ -50,22 +50,13 @@ ament_target_dependencies(drone_node
   drone_control
 )
 
-# =========================================================
-# 2. OUTROS EXECUTÁVEIS (Seus testes antigos)
-# =========================================================
-add_executable(offboard_takeoff src/offboard_takeoff.cpp)
-ament_target_dependencies(offboard_takeoff rclcpp mavros_msgs geometry_msgs)
 
-add_executable(integrated_controller src/integrated_controller.cpp)
-ament_target_dependencies(integrated_controller rclcpp mavros_msgs geometry_msgs nav_msgs)
 
 # =========================================================
 # 3. INSTALAÇÃO (Garante que o ROS 2 ache os executáveis)
 # =========================================================
 install(TARGETS
   drone_node
-  offboard_takeoff
-  integrated_controller
   DESTINATION lib/${PROJECT_NAME}
 )
 
