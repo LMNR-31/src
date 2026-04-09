@@ -70,25 +70,9 @@ void DroneControllerCompleto::handle_state4_landing()
         "✅ DISARM confirmado pelo FCU — transicionando para aguardar novo comando.");
       disarm_requested_ = false;
 
-      // If this DISARM is part of a mission interrupt cycle, advance to
-      // WAIT_TAKEOFF_WP so the takeoff waypoint from mission_manager is accepted
-      // even if the WAIT_LAND_WP / FOLLOW_LAND phase has already been processed.
-      // This is the key state transition that prevents the "takeoff recebido sem
-      // missão ativa" bug: the phase is now WAIT_TAKEOFF_WP, not NONE.
-      if (mission_cycle_phase_ == MissionCyclePhase::FOLLOW_LAND ||
-          mission_cycle_phase_ == MissionCyclePhase::WAIT_LAND_WP)
-      {
-        mission_cycle_phase_ = MissionCyclePhase::WAIT_TAKEOFF_WP;
-        RCLCPP_INFO(this->get_logger(),
-          "🔄 [MISSION WAIT_TAKEOFF_WP] DISARM confirmado durante ciclo de missão. "
-          "Aguardando waypoint de decolagem em /mission_waypoints...");
-      }
-
       state_voo_ = 0;
       RCLCPP_WARN(this->get_logger(),
-        "⏳ Aguardando novo comando de waypoint para decolar novamente... "
-        "(fase: %s)",
-        mission_cycle_phase_name(mission_cycle_phase_));
+        "⏳ Aguardando novo comando de waypoint para decolar novamente...");
     } else {
       RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
         "⏳ [DISARM] Aguardando confirmação de DISARM pelo FCU...");

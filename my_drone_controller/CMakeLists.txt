@@ -34,7 +34,6 @@ add_executable(drone_node
   src/command_queue.cpp
   src/waypoint_validation.cpp
   src/drone_controller_completo.cpp
-  src/fsm_common.cpp
   src/fsm_state0_wait.cpp
   src/fsm_takeoff.cpp
   src/fsm_hover.cpp

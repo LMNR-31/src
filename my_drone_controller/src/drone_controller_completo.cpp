@@ -192,10 +192,6 @@ void DroneControllerCompleto::setup_subscribers()
     waypoints_cmd_topic_, 1,
     std::bind(&DroneControllerCompleto::waypoints_callback, this, std::placeholders::_1));
 
-  mission_waypoints_sub_ = this->create_subscription<geometry_msgs::msg::PoseArray>(
-    "/mission_waypoints", 1,
-    std::bind(&DroneControllerCompleto::mission_waypoints_callback, this, std::placeholders::_1));
-
   waypoint_goal_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
     waypoint_goal_cmd_topic_, 1,
     std::bind(&DroneControllerCompleto::waypoint_goal_callback, this, std::placeholders::_1));
@@ -216,14 +212,10 @@ void DroneControllerCompleto::setup_subscribers()
     "/waypoints_4d", 1,
     std::bind(&DroneControllerCompleto::waypoints_4d_callback, this, std::placeholders::_1));
 
-  mission_interrupt_done_sub_ = this->create_subscription<std_msgs::msg::Int32>(
-    "/mission_interrupt_done", 10,
-    std::bind(&DroneControllerCompleto::mission_interrupt_done_callback, this, std::placeholders::_1));
-
   RCLCPP_INFO(this->get_logger(),
     "✓ Subscribers criados: /uav1/mavros/state, /uav1/mavros/extended_state, "
-    "%s (cmd), /mission_waypoints, %s (cmd), odometria, /uav1/yaw_override/cmd, "
-    "/waypoint_goal_4d, /waypoints_4d e /mission_interrupt_done",
+    "%s (cmd), %s (cmd), odometria, /uav1/yaw_override/cmd, "
+    "/waypoint_goal_4d e /waypoints_4d",
     waypoints_cmd_topic_.c_str(), waypoint_goal_cmd_topic_.c_str());
 }
 
@@ -308,10 +300,6 @@ void DroneControllerCompleto::init_variables()
   current_waypoint_idx_ = 0;
   waypoint_duration_ = config_.waypoint_duration;
   last_waypoint_reached_idx_ = -1;
-  mission_cycle_phase_ = MissionCyclePhase::NONE;
-  mission_wp_follow_idx_ = 0;
-  last_published_mission_wp_idx_ = -1;
-  mission_waypoints_.clear();
   current_z_real_ = 0.0;
   current_x_ned_ = 0.0;
   current_y_ned_ = 0.0;
@@ -337,7 +325,6 @@ void DroneControllerCompleto::init_variables()
   post_offboard_stream_count_ = 0;
   post_offboard_stream_done_ = false;
   setpoint_pub_time_initialized_ = false;
-  mission_enabled_ = false;
   planner_initialized_ = false;
 }
 
@@ -848,20 +835,6 @@ void DroneControllerCompleto::waypoints_callback(
     trajectory_started_ = false;
     last_waypoint_reached_idx_ = -1;
     last_waypoint_goal_.pose = msg->poses[0];
-    // Cancel any ongoing mission interrupt: new external trajectory replaces it.
-    mission_cycle_phase_ = MissionCyclePhase::NONE;
-    mission_waypoints_.clear();
-    mission_wp_follow_idx_ = 0;
-    last_published_mission_wp_idx_ = -1;
-    // New trajectory: disable mission gate until this trajectory finishes.
-    if (mission_enabled_) {
-      mission_enabled_ = false;
-      if (!is_landing_descent) {
-        RCLCPP_INFO(this->get_logger(),
-          "🔒 [MISSION] Nova trajetória recebida — mission_enabled_=false. "
-          "/mission_waypoints será ignorado durante a execução.");
-      }
-    }
 
     if (!is_landing_descent) {
       log_trajectory_waypoints_3d(trajectory_waypoints_);
@@ -880,153 +853,6 @@ void DroneControllerCompleto::waypoints_callback(
 
     activate_trajectory_in_hover(msg->poses.size());
   }
-}
-
-// ============================================================
-// MISSION WAYPOINTS CALLBACK (/mission_waypoints)
-// ============================================================
-
-void DroneControllerCompleto::mission_waypoints_callback(
-  const geometry_msgs::msg::PoseArray::SharedPtr msg)
-{
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  if (msg->poses.empty()) { return; }
-
-  // ── Gate: ignore /mission_waypoints until trajectory is fully complete ───
-  // mission_enabled_ is set to true only in finalize_trajectory_complete(),
-  // preventing any stale or spurious /mission_waypoints messages from
-  // interrupting an ongoing trajectory.
-  if (!mission_enabled_) {
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
-      "🔒 [MISSION] /mission_waypoints recebido com %zu pose(s) — trajetória ainda em "
-      "andamento (mission_enabled_=false). Ignorando até o final da trajetória.",
-      msg->poses.size());
-    return;
-  }
-
-  // ── Return-home: single pose received after trajectory completion ─────────
-  // When the supervisor publishes the home waypoint after all mission cycles
-  // are done, the drone may be in NONE (hovering after the last FOLLOW_TAKEOFF)
-  // or in WAIT_LAND_WP (holding at the last trajectory waypoint).  In both
-  // cases a single-pose message that arrives while the trajectory is truly
-  // finished should be treated as a navigation target, not as a per-waypoint
-  // takeoff command.
-  {
-    const bool trajectory_complete =
-      trajectory_started_ &&
-      !trajectory_waypoints_.empty() &&
-      current_waypoint_idx_ >= static_cast<int>(trajectory_waypoints_.size());
-
-    if (msg->poses.size() == 1 &&
-        trajectory_complete &&
-        (mission_cycle_phase_ == MissionCyclePhase::NONE ||
-         mission_cycle_phase_ == MissionCyclePhase::WAIT_LAND_WP))
-    {
-      const char * prev_phase_name   = mission_cycle_phase_name(mission_cycle_phase_);
-      return_home_target_            = msg->poses[0];
-      mission_cycle_phase_           = MissionCyclePhase::RETURN_HOME;
-      mission_waypoints_.clear();
-      mission_wp_follow_idx_         = 0;
-      last_published_mission_wp_idx_ = -1;
-      controlador_ativo_             = true;  // activates handle_state3_trajectory() if drone is hovering in state 2
-      RCLCPP_INFO(this->get_logger(),
-        "🏠 [RETURN_HOME] Waypoint de retorno à origem recebido "
-        "(x=%.2f, y=%.2f, z=%.2f) após trajetória concluída (fase anterior: %s). "
-        "Iniciando navegação de retorno.",
-        return_home_target_.position.x,
-        return_home_target_.position.y,
-        return_home_target_.position.z,
-        prev_phase_name);
-      return;
-    }
-  }
-
-  // Takeoff waypoint: single pose with z >= land_z_threshold.
-  // Re-arms the drone without clearing the stored main trajectory so that
-  // handle_state2_hover() can resume STATE 3 at the saved current_waypoint_idx_.
-  if (msg->poses.size() == 1 &&
-      msg->poses[0].position.z >= config_.land_z_threshold)
-  {
-    // Accept takeoff only when the mission cycle is in the WAIT_TAKEOFF_WP phase.
-    // This phase is set when DISARM is confirmed after the landing, so the
-    // takeoff waypoint is accepted even if the landing portion is already done.
-    if (mission_cycle_phase_ != MissionCyclePhase::WAIT_TAKEOFF_WP) {
-      RCLCPP_WARN(this->get_logger(),
-        "⚠️ /mission_waypoints (takeoff) recebido em fase '%s' – ignorado. "
-        "Esperado: WAIT_TAKEOFF_WP.",
-        mission_cycle_phase_name(mission_cycle_phase_));
-      return;
-    }
-
-    // Only trigger re-arm when waiting for a new command (state 0).
-    // If DISARM is still pending (state 4, armed=true) wait for the FCU.
-    if (handle_state4_disarm_reset()) { return; }
-    if (state_voo_ != 0) { return; }  // already arming/flying, ignore duplicate
-
-    // Guard against near-origin XY; override with latch pose when fresh.
-    const geometry_msgs::msg::Pose safe_pose = sanitize_takeoff_xy(msg->poses[0]);
-
-    {
-      const double z_cmd = safe_pose.position.z;
-      takeoff_target_z_ = std::min(
-        config_.max_altitude,
-        std::max(config_.min_altitude, z_cmd));
-      RCLCPP_INFO(this->get_logger(),
-        "⬆️ [MISSION TAKEOFF TARGET] Z_cmd=%.2fm | clamp[%.2f..%.2f] → Z_alvo=%.2fm (fixo durante subida)",
-        z_cmd, config_.min_altitude, config_.max_altitude, takeoff_target_z_);
-    }
-
-    last_waypoint_goal_.pose = safe_pose;
-    pouso_em_andamento_ = false;
-    controlador_ativo_ = false;
-    // Intentionally do NOT clear trajectory_waypoints_ / trajectory_started_ /
-    // current_waypoint_idx_ — the main trajectory must be preserved so that
-    // handle_state2_hover() can resume it after the drone reaches altitude.
-
-    // Advance phase: drone is now climbing; trajectory resumes at z >= MISSION_RESUME_ALTITUDE_M.
-    mission_cycle_phase_ = MissionCyclePhase::FOLLOW_TAKEOFF;
-
-    activate_offboard_arm_if_needed();
-
-    takeoff_cmd_id_ = cmd_queue_.enqueue(
-      CommandType::TAKEOFF,
-      {{"x", std::to_string(safe_pose.position.x)},
-       {"y", std::to_string(safe_pose.position.y)},
-       {"z", std::to_string(config_.hover_altitude)}});
-
-    // Publish the sanitized goal so /waypoint_goal monitoring is consistent.
-    publish_waypoint_goal_status(
-      safe_pose.position.x, safe_pose.position.y, safe_pose.position.z);
-
-    state_voo_ = 1;
-    takeoff_counter_ = 0;
-    RCLCPP_INFO(this->get_logger(),
-      "🚀 [MISSION FOLLOW_TAKEOFF] Re-arm/decolagem iniciada (z_alvo=%.2f m). "
-      "Retomará trajetória em WP[%d] após z >= %.1f m.",
-      takeoff_target_z_, current_waypoint_idx_, MISSION_RESUME_ALTITUDE_M);
-    return;
-  }
-
-  // Landing waypoints: store for use by handle_mission_interrupt_in_state3().
-  // Accept when waiting for landing waypoints (WAIT_LAND_WP) or when the drone
-  // is already navigating back to the origin (RETURN_HOME) and the landing
-  // publisher fires once the drone arrives at the home position.
-  if (mission_cycle_phase_ != MissionCyclePhase::WAIT_LAND_WP &&
-      mission_cycle_phase_ != MissionCyclePhase::RETURN_HOME) {
-    RCLCPP_WARN(this->get_logger(),
-      "⚠️ /mission_waypoints (pouso) recebido em fase '%s' – ignorado. "
-      "Esperado: WAIT_LAND_WP ou RETURN_HOME.",
-      mission_cycle_phase_name(mission_cycle_phase_));
-    return;
-  }
-
-  mission_waypoints_ = msg->poses;
-  mission_wp_follow_idx_ = 0;
-  mission_cycle_phase_ = MissionCyclePhase::FOLLOW_LAND;
-  RCLCPP_INFO(this->get_logger(),
-    "📍 [MISSION FOLLOW_LAND] %zu waypoints de pouso recebidos em /mission_waypoints.",
-    msg->poses.size());
 }
 
 // ============================================================
@@ -1393,18 +1219,8 @@ void DroneControllerCompleto::monitor_waypoint_goal_heartbeat()
   double x = 0.0, y = 0.0, z = 0.0;
 
   // Source priority:
-  // 1) FOLLOW_LAND phase with mission waypoints → current mission landing waypoint
-  if (mission_cycle_phase_ == MissionCyclePhase::FOLLOW_LAND && !mission_waypoints_.empty()) {
-    int idx = mission_wp_follow_idx_;
-    if (idx < 0) { idx = 0; }
-    if (static_cast<size_t>(idx) >= mission_waypoints_.size()) {
-      idx = static_cast<int>(mission_waypoints_.size()) - 1;
-    }
-    const auto & p = mission_waypoints_[idx].position;
-    x = p.x; y = p.y; z = p.z;
-  }
-  // 2) Trajectory active with waypoints → current trajectory waypoint (clamped)
-  else if (state_voo_ == 3 && !trajectory_waypoints_.empty()) {
+  // 1) Trajectory active with waypoints → current trajectory waypoint (clamped)
+  if (state_voo_ == 3 && !trajectory_waypoints_.empty()) {
     int idx = current_waypoint_idx_;
     if (idx < 0) { idx = 0; }
     if (static_cast<size_t>(idx) >= trajectory_waypoints_.size()) {
@@ -1413,7 +1229,7 @@ void DroneControllerCompleto::monitor_waypoint_goal_heartbeat()
     const auto & p = trajectory_waypoints_[idx].position;
     x = p.x; y = p.y; z = p.z;
   }
-  // 3) Fall back to the last received waypoint goal
+  // 2) Fall back to the last received waypoint goal
   else {
     const auto & p = last_waypoint_goal_.pose.position;
     x = p.x; y = p.y; z = p.z;

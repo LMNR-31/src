@@ -29,28 +29,6 @@ void DroneControllerCompleto::handle_state2_hover()
     last_waypoint_goal_.pose.position.y,
     controlador_ativo_ ? "ATIVO" : "INATIVO");
 
-  // After a mission interrupt re-arm, resume the main trajectory when the
-  // drone has reached a safe altitude (z >= MISSION_RESUME_ALTITUDE_M).
-  if (mission_cycle_phase_ == MissionCyclePhase::FOLLOW_TAKEOFF &&
-      current_z_real_ >= MISSION_RESUME_ALTITUDE_M)
-  {
-    RCLCPP_INFO(this->get_logger(),
-      "✅ [MISSION FOLLOW_TAKEOFF] Altitude %.2f m >= %.1f m após re-arm. "
-      "Retomando trajetória principal em WP[%d]. Fase: NONE.",
-      current_z_real_, MISSION_RESUME_ALTITUDE_M, current_waypoint_idx_);
-    mission_cycle_phase_ = MissionCyclePhase::NONE;
-    mission_waypoints_.clear();
-    mission_wp_follow_idx_ = 0;
-    last_published_mission_wp_idx_ = -1;
-    // Only resume trajectory if there are remaining waypoints.
-    if (!trajectory_waypoints_.empty() &&
-        current_waypoint_idx_ < static_cast<int>(trajectory_waypoints_.size()))
-    {
-      controlador_ativo_ = true;
-    }
-    return;
-  }
-
   // Detect landing from autopilot signal during HOVER (e.g. after trajectory
   // completes at a landing waypoint above the initial takeoff altitude).
   if (autopilot_indicates_landing()) {
