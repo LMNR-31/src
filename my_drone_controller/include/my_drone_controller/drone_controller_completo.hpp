@@ -113,6 +113,10 @@ public:
   DroneControllerCompleto();
 
 private:
+  // ── Mission cycle phase helpers ──────────────────────────────────────────
+  /// Returns a stable human-readable name for each MissionCyclePhase value.
+  static const char * mission_cycle_phase_name(MissionCyclePhase p);
+
   // ── Setup ────────────────────────────────────────────────────────────────
   void load_parameters();
   void setup_publishers();
