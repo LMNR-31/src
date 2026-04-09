@@ -26,13 +26,19 @@ include_directories(
 # =========================================================
 # 1. EXECUTÁVEL PRINCIPAL DO DRONE
 # Código dividido em módulos: command_queue, waypoint_validation,
-# drone_controller_completo e main.
+# drone_controller_completo, fsm_state0_wait, fsm_takeoff, fsm_hover,
+# fsm_trajectory, fsm_landing e main.
 # =========================================================
 add_executable(drone_node
   src/main.cpp
   src/command_queue.cpp
   src/waypoint_validation.cpp
   src/drone_controller_completo.cpp
+  src/fsm_state0_wait.cpp
+  src/fsm_takeoff.cpp
+  src/fsm_hover.cpp
+  src/fsm_trajectory.cpp
+  src/fsm_landing.cpp
   src/Drone_codegen.cpp
   src/TrajectoryPlanner_codegen.cpp
   src/rt_nonfinite.cpp
