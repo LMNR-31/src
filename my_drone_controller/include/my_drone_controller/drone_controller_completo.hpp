@@ -30,18 +30,6 @@
 
 namespace drone_control {
 
-/// Phase of a per-waypoint mission-interrupt cycle (land → disarm → rest → re-arm → takeoff).
-/// Using an explicit phase instead of a single boolean prevents the race where
-/// mission_interrupt_active_ is cleared before the takeoff waypoint arrives.
-enum class MissionCyclePhase {
-  NONE,            ///< No mission interrupt active.
-  WAIT_LAND_WP,    ///< Waypoint reached; waiting for landing waypoints on /mission_waypoints.
-  FOLLOW_LAND,     ///< Landing waypoints received; drone is descending toward ground.
-  WAIT_TAKEOFF_WP, ///< Landing + DISARM complete; waiting for takeoff waypoint on /mission_waypoints.
-  FOLLOW_TAKEOFF,  ///< Takeoff waypoint received; drone ascending; trajectory resumes at z >= 1.5 m.
-  RETURN_HOME,     ///< Trajectory complete; single-pose home waypoint received; drone navigating to origin.
-};
-
 /**
  * @brief Complete drone controller node with command tracking and safety.
  *
@@ -94,10 +82,6 @@ public:
   /// Watchdog: maximum allowed silence between setpoint publishes (0.05 s = 1 / 20 Hz).
   static constexpr double MAX_SETPOINT_SILENCE_S = 1.0 / MIN_SETPOINT_RATE_HZ;
 
-  /// Minimum altitude [m] the drone must reach after a mission-interrupt re-arm
-  /// before the FSM considers the takeoff complete and resumes the main trajectory.
-  static constexpr double MISSION_RESUME_ALTITUDE_M = 1.5;
-
   /// Minimum number of setpoints to publish before requesting ARM+OFFBOARD.
   /// At 100 Hz this equates to ~200 ms of continuous streaming, which is
   /// enough for the PX4 FCU to accept the ARM command in OFFBOARD mode.
@@ -113,10 +97,6 @@ public:
   DroneControllerCompleto();
 
 private:
-  // ── Mission cycle phase helpers ──────────────────────────────────────────
-  /// Returns a stable human-readable name for each MissionCyclePhase value.
-  static const char * mission_cycle_phase_name(MissionCyclePhase p);
-
   // ── Setup ────────────────────────────────────────────────────────────────
   void load_parameters();
   void setup_publishers();
@@ -201,7 +181,6 @@ private:
 
   // ── Waypoint callbacks ───────────────────────────────────────────────────
   void waypoints_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg);
-  void mission_waypoints_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg);
 
   // ── Shared waypoint-goal helpers ─────────────────────────────────────────
   bool check_landing_in_flight(double z);
@@ -215,11 +194,6 @@ private:
   void waypoint_goal_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
   void waypoint_goal_4d_callback(const drone_control::msg::Waypoint4D::SharedPtr msg);
   void waypoints_4d_callback(const drone_control::msg::Waypoint4DArray::SharedPtr msg);
-  /// Called when mission_manager publishes to /mission_interrupt_done after the
-  /// full land/disarm/wait/rearm/takeoff cycle completes.  Resumes the main
-  /// trajectory from current_waypoint_idx_ if it has not already been resumed
-  /// by the altitude-based check in handle_state2_hover().
-  void mission_interrupt_done_callback(const std_msgs::msg::Int32::SharedPtr msg);
 
   // ── Setpoint publishing ──────────────────────────────────────────────────
   void publishPositionTarget(double x, double y, double z,
@@ -279,7 +253,6 @@ private:
   void publish_trajectory_waypoint_setpoint(int idx);
   void log_trajectory_progress(int idx);
   void finalize_trajectory_complete();
-  void handle_mission_interrupt_in_state3();
   void handle_state3_trajectory();
 
   // State 4 — landing completers
@@ -310,16 +283,11 @@ private:
   rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr state_sub_;
   rclcpp::Subscription<mavros_msgs::msg::ExtendedState>::SharedPtr extended_state_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr waypoints_sub_;
-  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr mission_waypoints_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr waypoint_goal_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<drone_control::msg::YawOverride>::SharedPtr yaw_override_sub_;
   rclcpp::Subscription<drone_control::msg::Waypoint4D>::SharedPtr waypoint_goal_4d_sub_;
   rclcpp::Subscription<drone_control::msg::Waypoint4DArray>::SharedPtr waypoints_4d_sub_;
-  /// Receives the completion signal from mission_manager after the full
-  /// land/disarm/wait/rearm/takeoff cycle has finished, enabling the
-  /// controller to resume the main trajectory from the next waypoint.
-  rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr mission_interrupt_done_sub_;
 
   // ── Service clients ───────────────────────────────────────────────────────
   rclcpp::Client<mavros_msgs::srv::SetMode>::SharedPtr mode_client_;
@@ -380,24 +348,6 @@ private:
   /// -1 means no waypoint has been published yet for the current trajectory.
   int last_waypoint_reached_idx_;
 
-  /// Last mission waypoint index for which /waypoint_goal was published (debounce).
-  /// Reset to -1 when mission_waypoints_ is cleared.
-  int last_published_mission_wp_idx_{-1};
-
-  // ── Mission interrupt state (per-waypoint land/disarm/rearm/takeoff cycle) ──
-  /// Phase of the current per-waypoint mission cycle.  NONE means no cycle is
-  /// active.  Using an explicit phase (rather than a single boolean) prevents
-  /// the race where a single flag is cleared before the takeoff waypoint arrives.
-  MissionCyclePhase mission_cycle_phase_{MissionCyclePhase::NONE};
-  /// Current index into mission_waypoints_ being followed.
-  int mission_wp_follow_idx_{0};
-  /// Waypoints for the current mission cycle (landing or takeoff), received
-  /// on /mission_waypoints.  Cleared at the start of each interrupt cycle.
-  std::vector<geometry_msgs::msg::Pose> mission_waypoints_;
-  /// Target pose for the RETURN_HOME phase (single pose published by the
-  /// supervisor after all mission cycles are complete).
-  geometry_msgs::msg::Pose return_home_target_{};
-
   // ── Odometry (NED) ───────────────────────────────────────────────────────
   double current_z_real_;
   double current_x_ned_;
@@ -434,11 +384,6 @@ private:
   // ── Control flags ────────────────────────────────────────────────────────
   bool enabled_{true};
   bool override_active_{false};
-  /// Gate for /mission_waypoints processing.
-  /// False during normal trajectory execution; set to true by
-  /// finalize_trajectory_complete() once the full trajectory has been visited.
-  /// Reset to false when a new multi-pose trajectory arrives via /waypoints.
-  bool mission_enabled_{false};
   /// Loop guard: skip the next /waypoint_goal message coming from our own publisher.
   int skip_self_waypoint_goal_count_{0};
   /// Loop guard: skip the next /waypoints message coming from our own publisher.

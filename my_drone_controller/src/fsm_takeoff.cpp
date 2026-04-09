@@ -305,8 +305,7 @@ void DroneControllerCompleto::handle_state1_takeoff()
   }
 
   // The takeoff target altitude was computed and fixed at command-receive time
-  // (in handle_single_takeoff_waypoint_command(), mission_waypoints_callback(),
-  // or the 4D equivalent) as:
+  // (in handle_single_takeoff_waypoint_command() or the 4D equivalent) as:
   //   takeoff_target_z_ = clamp(waypoint.z, min_altitude, max_altitude)
   //
   // The drone climbs to the Z commanded by the waypoint (respecting physical
