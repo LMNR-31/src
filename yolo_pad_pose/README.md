@@ -109,6 +109,81 @@ COLLECT → NAVIGATE → DWELL → NAVIGATE → … → RETURN_HOME → DONE
 
 ## yolo_pad_pose (detector node)
 
+The `yolo_pad_pose_ros2` node now **automatically publishes static TFs and the
+odom→TF dynamic transform** when started, so you no longer need to run the
+separate `tf_body_fallback.launch.py`, `tf_camera_static.launch.py` launch
+files or the `odom_tf_broadcaster` node alongside it.
+
+### Integrated TF publishing
+
+#### Static TFs (`enable_static_tfs`, default `true`)
+
+On startup the node calls `tf2_ros.StaticTransformBroadcaster.sendTransform`
+once with the following three transforms (previously published by the
+`tf_body_fallback` and `tf_camera_static` launch files):
+
+| Parent frame      | Child frame        | Translation (x, y, z)    | Rotation RPY |
+|-------------------|--------------------|--------------------------|--------------|
+| `uav1/base_link`  | `uav1/fcu`         | `0.0, 0.0, 0.0`          | `0, 0, 0`    |
+| `uav1/fcu`        | `uav1/rgbd_down`   | `0.153, 0.0, -0.129`     | `0, 0, 0`    |
+| `uav1/fcu`        | `uav1/rgbd_front`  | `0.181, 0.0, -0.089`     | `0, 0, 0`    |
+
+Set `enable_static_tfs:=false` to disable this behaviour if the transforms
+are already published by another process.
+
+Frame names are overridable via parameters (see table below).
+
+#### Dynamic odom TF (`enable_odom_tf`, default `true`)
+
+The node subscribes to the odometry topic and re-publishes the pose as a
+`geometry_msgs/TransformStamped` on `/tf` using
+`tf2_ros.TransformBroadcaster`.  This replaces the former `odom_tf_broadcaster`
+node.
+
+Set `enable_odom_tf:=false` to disable this behaviour.
+
+### New parameters
+
+| Parameter                   | Type   | Default                              | Description |
+|-----------------------------|--------|--------------------------------------|-------------|
+| `enable_static_tfs`         | bool   | `true`                               | Publish static TFs on startup (replaces `tf_body_fallback` + `tf_camera_static` launch files). |
+| `tf_base_link_frame`        | string | `uav1/base_link`                     | Parent frame for the base\_link→fcu static TF. |
+| `tf_fcu_frame`              | string | `uav1/fcu`                           | Child frame for the base\_link→fcu TF / parent for camera TFs. |
+| `tf_rgbd_down_frame`        | string | `uav1/rgbd_down`                     | Child frame for the fcu→rgbd\_down static TF. |
+| `tf_rgbd_front_frame`       | string | `uav1/rgbd_front`                    | Child frame for the fcu→rgbd\_front static TF. |
+| `enable_odom_tf`            | bool   | `true`                               | Subscribe to odom and broadcast dynamic TF (replaces `odom_tf_broadcaster`). |
+| `odom_topic`                | string | `/uav1/mavros/local_position/odom`   | Odometry topic to subscribe to. |
+| `tf_parent_frame_override`  | string | `""`                                 | Override TF parent frame (default: use `msg.header.frame_id`). |
+| `tf_child_frame_override`   | string | `""`                                 | Override TF child frame (default: use `msg.child_frame_id`). |
+| `use_odom_header_stamp`     | bool   | `true`                               | Use the Odometry message stamp; if `false`, use the node's current time. |
+
+### Verification
+
+After starting the node:
+
+```bash
+# Static TFs
+ros2 run tf2_ros tf2_echo uav1/base_link uav1/fcu
+ros2 run tf2_ros tf2_echo uav1/fcu uav1/rgbd_down
+ros2 run tf2_ros tf2_echo uav1/fcu uav1/rgbd_front
+
+# Dynamic odom TF (requires messages on the odom topic)
+ros2 run tf2_ros tf2_echo uav1/map uav1/base_link
+```
+
+### Disabling individual features
+
+```bash
+# Disable both (run external broadcasters manually, as before)
+ros2 run yolo_pad_pose yolo_pad_pose_ros2 --ros-args \
+  -p enable_static_tfs:=false \
+  -p enable_odom_tf:=false
+
+# Disable only the odom TF (e.g. another node already handles it)
+ros2 run yolo_pad_pose yolo_pad_pose_ros2 --ros-args \
+  -p enable_odom_tf:=false
+```
+
 ### Range filter parameters
 
 To prevent high-confidence false positives at long range from being published
@@ -321,63 +396,3 @@ and a finer `DEBUG`-level line shows the full projection pipeline:
 ```
 
 ---
-
-## odom_tf_broadcaster
-
-### Why is this needed?
-
-MAVROS publishes odometry on `/uav1/mavros/local_position/odom`
-(`nav_msgs/Odometry`) with `header.frame_id = uav1/map` and
-`child_frame_id = uav1/base_link`, but it **does not** write the corresponding
-transform to `/tf`.  This causes the TF tree to be disconnected:
-
-```
-$ ros2 run tf2_ros tf2_echo uav1/map uav1/base_link
-# → "frame does not exist" / "two or more unconnected trees"
-```
-
-`odom_tf_broadcaster` subscribes to the Odometry topic and re-publishes the
-pose as a `geometry_msgs/TransformStamped` on `/tf` so the tree is connected.
-
-### Running the node
-
-```bash
-ros2 run yolo_pad_pose odom_tf_broadcaster
-```
-
-Or with a custom odometry topic:
-
-```bash
-ros2 run yolo_pad_pose odom_tf_broadcaster --ros-args \
-  -p odom_topic:=/uav1/mavros/local_position/odom
-```
-
-### Parameters
-
-| Parameter                 | Type   | Default                                  | Description                                              |
-|---------------------------|--------|------------------------------------------|----------------------------------------------------------|
-| `odom_topic`              | string | `/uav1/mavros/local_position/odom`       | Odometry topic to subscribe to                           |
-| `tf_parent_frame_override`| string | `""` (use `msg.header.frame_id`)         | Override the TF parent frame id                          |
-| `tf_child_frame_override` | string | `""` (use `msg.child_frame_id`)          | Override the TF child frame id (falls back to `base_link`)|
-| `use_odom_header_stamp`   | bool   | `true`                                   | Use the Odometry message stamp; if `false`, use `now()`  |
-
-### Verifying the TF is published
-
-After starting the node, run:
-
-```bash
-ros2 run tf2_ros tf2_echo uav1/map uav1/base_link
-```
-
-You should see transforms printing continuously without any
-"frame does not exist" or "two or more unconnected trees" errors.
-
-### Running alongside pad_waypoint_supervisor
-
-A launch file is provided:
-
-```bash
-ros2 launch yolo_pad_pose odom_tf_broadcaster.launch.py
-```
-
-This starts both `odom_tf_broadcaster` and `pad_waypoint_supervisor` together.
