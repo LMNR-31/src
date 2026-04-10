@@ -10,8 +10,6 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch',
-            ['launch/odom_tf_broadcaster.launch.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -30,7 +28,6 @@ setup(
           'capture_dataset = dataset_capture.capture_dataset:main',
           'pad_waypoint_supervisor = yolo_pad_pose.pad_waypoint_supervisor:main',
           'pad_waypoint_nn = yolo_pad_pose.base_waypoint_publisher:main',
-          'odom_tf_broadcaster = yolo_pad_pose.odom_tf_broadcaster:main',
         ],
     },
 )

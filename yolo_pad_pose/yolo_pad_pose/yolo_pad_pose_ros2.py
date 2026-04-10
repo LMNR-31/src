@@ -73,15 +73,15 @@ class YoloPadPose(Node):
         self.declare_parameter("down_depth", "/uav1/rgbd_down/depth/image_raw")
         self.declare_parameter("down_info",  "/uav1/rgbd_down/color/camera_info")
 
-        # Static TFs (equivalent to tf_body_fallback.launch.py and
-        # tf_camera_static.launch.py).  Published once on startup when enabled.
+        # Static TFs (equivalent to the former tf_body_fallback and
+        # tf_camera_static launch files).  Published once on startup when enabled.
         self.declare_parameter("enable_static_tfs", True)
         self.declare_parameter("tf_base_link_frame", "uav1/base_link")
         self.declare_parameter("tf_fcu_frame",        "uav1/fcu")
         self.declare_parameter("tf_rgbd_down_frame",  "uav1/rgbd_down")
         self.declare_parameter("tf_rgbd_front_frame", "uav1/rgbd_front")
 
-        # Odom → TF (equivalent to odom_tf_broadcaster.py).
+        # Odom → TF (equivalent to the former odom_tf_broadcaster node).
         self.declare_parameter("enable_odom_tf", True)
         self.declare_parameter("odom_topic",
                                "/uav1/mavros/local_position/odom")
@@ -191,8 +191,8 @@ class YoloPadPose(Node):
     def _publish_static_tfs_once(self):
         """Publish the three static transforms once on startup.
 
-        Equivalent to running tf_body_fallback.launch.py and
-        tf_camera_static.launch.py together:
+        Equivalent to the former tf_body_fallback and tf_camera_static
+        launch files:
           - tf_base_link_frame -> tf_fcu_frame       (0,0,0 / rpy 0,0,0)
           - tf_fcu_frame -> tf_rgbd_down_frame  (0.153, 0, -0.129 / rpy 0,0,0)
           - tf_fcu_frame -> tf_rgbd_front_frame (0.181, 0, -0.089 / rpy 0,0,0)
