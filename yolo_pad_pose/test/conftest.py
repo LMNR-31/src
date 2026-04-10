@@ -48,7 +48,6 @@ for _attr, _mod in [
     ('PoseArray', 'geometry_msgs.msg'),
     ('PointStamped', 'geometry_msgs.msg'),
     ('Point', 'geometry_msgs.msg'),
-    ('TransformStamped', 'geometry_msgs.msg'),
     ('Odometry', 'nav_msgs.msg'),
     ('Int32', 'std_msgs.msg'),
     ('Image', 'sensor_msgs.msg'),
@@ -62,6 +61,4 @@ sys.modules['message_filters'].ApproximateTimeSynchronizer = object
 sys.modules['ultralytics'].YOLO = object
 sys.modules['tf2_ros'].Buffer = object
 sys.modules['tf2_ros'].TransformListener = object
-sys.modules['tf2_ros'].StaticTransformBroadcaster = object
-sys.modules['tf2_ros'].TransformBroadcaster = object
 sys.modules['tf2_geometry_msgs'].do_transform_point = lambda p, t: p

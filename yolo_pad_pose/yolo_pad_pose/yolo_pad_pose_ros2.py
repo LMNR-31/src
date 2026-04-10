@@ -5,8 +5,7 @@ import rclpy
 from rclpy.node import Node
 
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PointStamped, Point, TransformStamped
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PointStamped, Point
 from cv_bridge import CvBridge
 
 import numpy as np
@@ -73,22 +72,6 @@ class YoloPadPose(Node):
         self.declare_parameter("down_depth", "/uav1/rgbd_down/depth/image_raw")
         self.declare_parameter("down_info",  "/uav1/rgbd_down/color/camera_info")
 
-        # Static TFs (equivalent to the former tf_body_fallback and
-        # tf_camera_static launch files).  Published once on startup when enabled.
-        self.declare_parameter("enable_static_tfs", True)
-        self.declare_parameter("tf_base_link_frame", "uav1/base_link")
-        self.declare_parameter("tf_fcu_frame",        "uav1/fcu")
-        self.declare_parameter("tf_rgbd_down_frame",  "uav1/rgbd_down")
-        self.declare_parameter("tf_rgbd_front_frame", "uav1/rgbd_front")
-
-        # Odom → TF (equivalent to the former odom_tf_broadcaster node).
-        self.declare_parameter("enable_odom_tf", True)
-        self.declare_parameter("odom_topic",
-                               "/uav1/mavros/local_position/odom")
-        self.declare_parameter("tf_parent_frame_override", "")
-        self.declare_parameter("tf_child_frame_override",  "")
-        self.declare_parameter("use_odom_header_stamp", True)
-
         self.model_path = self.get_parameter("model_path").value
         self.conf = float(self.get_parameter("conf").value)
         self.base_class_id = int(self.get_parameter("base_class_id").value)
@@ -115,37 +98,6 @@ class YoloPadPose(Node):
         # TF
         self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(seconds=10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-
-        # TF broadcasters (static + dynamic odom)
-        self._static_broadcaster = tf2_ros.StaticTransformBroadcaster(self)
-        self._odom_broadcaster = tf2_ros.TransformBroadcaster(self)
-
-        self._enable_static_tfs = bool(
-            self.get_parameter("enable_static_tfs").value)
-        self._enable_odom_tf = bool(
-            self.get_parameter("enable_odom_tf").value)
-
-        self._tf_base_link = self.get_parameter("tf_base_link_frame").value
-        self._tf_fcu = self.get_parameter("tf_fcu_frame").value
-        self._tf_rgbd_down = self.get_parameter("tf_rgbd_down_frame").value
-        self._tf_rgbd_front = self.get_parameter("tf_rgbd_front_frame").value
-
-        self._odom_topic = self.get_parameter("odom_topic").value
-        self._parent_override = self.get_parameter(
-            "tf_parent_frame_override").value
-        self._child_override = self.get_parameter(
-            "tf_child_frame_override").value
-        self._use_header_stamp = bool(
-            self.get_parameter("use_odom_header_stamp").value)
-
-        if self._enable_static_tfs:
-            self._publish_static_tfs_once()
-
-        if self._enable_odom_tf:
-            self._sub_odom = self.create_subscription(
-                Odometry, self._odom_topic, self._odom_cb, 10)
-            self.get_logger().info(
-                f"ODOM->TF enabled. Subscribed to: {self._odom_topic}")
 
         # Publishers
         # /landing_pad/base_relative_position — primary topic for base (class 0)
@@ -185,78 +137,6 @@ class YoloPadPose(Node):
         # Throttle state for range-rejection warnings (one per class, at most 1 Hz).
         self._base_range_warn_t: float = -float('inf')
         self._h_range_warn_t: float = -float('inf')
-
-    # ── Static TFs ───────────────────────────────────────────────────────────
-
-    def _publish_static_tfs_once(self):
-        """Publish the three static transforms once on startup.
-
-        Equivalent to the former tf_body_fallback and tf_camera_static
-        launch files:
-          - tf_base_link_frame -> tf_fcu_frame       (0,0,0 / rpy 0,0,0)
-          - tf_fcu_frame -> tf_rgbd_down_frame  (0.153, 0, -0.129 / rpy 0,0,0)
-          - tf_fcu_frame -> tf_rgbd_front_frame (0.181, 0, -0.089 / rpy 0,0,0)
-        """
-        now = self.get_clock().now().to_msg()
-
-        def _mk(parent, child, x, y, z):
-            t = TransformStamped()
-            t.header.stamp = now
-            t.header.frame_id = parent
-            t.child_frame_id = child
-            t.transform.translation.x = float(x)
-            t.transform.translation.y = float(y)
-            t.transform.translation.z = float(z)
-            # RPY (0,0,0) → quaternion (0,0,0,1)
-            t.transform.rotation.x = 0.0
-            t.transform.rotation.y = 0.0
-            t.transform.rotation.z = 0.0
-            t.transform.rotation.w = 1.0
-            return t
-
-        transforms = [
-            _mk(self._tf_base_link, self._tf_fcu,        0.0,   0.0,  0.0),
-            _mk(self._tf_fcu,       self._tf_rgbd_down,  0.153, 0.0, -0.129),
-            _mk(self._tf_fcu,       self._tf_rgbd_front, 0.181, 0.0, -0.089),
-        ]
-        self._static_broadcaster.sendTransform(transforms)
-        self.get_logger().info(
-            "Static TFs published: "
-            f"{self._tf_base_link}->{self._tf_fcu}, "
-            f"{self._tf_fcu}->{self._tf_rgbd_down}, "
-            f"{self._tf_fcu}->{self._tf_rgbd_front}"
-        )
-
-    # ── Odom → TF ────────────────────────────────────────────────────────────
-
-    def _odom_cb(self, msg: Odometry):
-        """Re-publish nav_msgs/Odometry pose as a dynamic TF transform."""
-        t = TransformStamped()
-
-        if self._use_header_stamp:
-            t.header.stamp = msg.header.stamp
-        else:
-            t.header.stamp = self.get_clock().now().to_msg()
-
-        t.header.frame_id = self._parent_override or msg.header.frame_id
-        t.child_frame_id = (
-            self._child_override or msg.child_frame_id or "base_link"
-        )
-
-        pos = msg.pose.pose.position
-        t.transform.translation.x = pos.x
-        t.transform.translation.y = pos.y
-        t.transform.translation.z = pos.z
-
-        ori = msg.pose.pose.orientation
-        t.transform.rotation.x = ori.x
-        t.transform.rotation.y = ori.y
-        t.transform.rotation.z = ori.z
-        t.transform.rotation.w = ori.w
-
-        self._odom_broadcaster.sendTransform(t)
-
-    # ── YOLO helpers ─────────────────────────────────────────────────────────
 
     def _detection_to_base_link(
         self,
