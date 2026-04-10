@@ -30,7 +30,6 @@ setup(
           'capture_dataset = dataset_capture.capture_dataset:main',
           'pad_waypoint_supervisor = yolo_pad_pose.pad_waypoint_supervisor:main',
           'pad_waypoint_nn = yolo_pad_pose.base_waypoint_publisher:main',
-          'yolo_mission_controller = yolo_pad_pose.yolo_mission_controller:main',
           'odom_tf_broadcaster = yolo_pad_pose.odom_tf_broadcaster:main',
         ],
     },

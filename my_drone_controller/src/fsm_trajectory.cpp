@@ -335,4 +335,5 @@ void DroneControllerCompleto::handle_state3_trajectory()
         last_waypoint_reached_idx_);
     }
   }
+}
 }  // namespace drone_control
