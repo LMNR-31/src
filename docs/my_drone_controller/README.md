@@ -6,6 +6,7 @@ Bem-vindo à documentação do pacote `my_drone_controller`. Esta documentação
 
 | Arquivo | Conteúdo |
 |---------|----------|
+| [00 — Inventário Completo de Arquivos](00-inventario-arquivos-src.md) | Lista completa de todos os 16 arquivos de `my_drone_controller/src` com papel, funções, relação com a FSM e **o que cada bloco de código faz** |
 | [01 — Visão Geral](01-visao-geral.md) | Objetivo do nó, arquitetura ROS 2/MAVROS/PX4, módulos, FSM 5 estados e fluxo de dados |
 | [02 — Build e Execução](02-build-e-execucao.md) | Dependências, compilação via `colcon`, execução, parâmetros ROS 2 e tópicos cmd vs status |
 | [03 — Setup (Parte 1)](03-drone_controller_completo-parte1-setup.md) | `includes`, namespace, construtor, `load_parameters`, `setup_publishers`, `setup_subscribers`, `setup_services`, `init_variables` |
@@ -48,9 +49,13 @@ my_drone_controller/
     ├── fsm_landing.cpp                    ← Estado 4: pouso
     ├── command_queue.cpp
     ├── waypoint_validation.cpp
-    ├── Drone_codegen.cpp
-    ├── TrajectoryPlanner_codegen.cpp
-    └── ...
+    ├── Drone_codegen.cpp                  ← controlador PID (MATLAB codegen)
+    ├── TrajectoryPlanner_codegen.cpp      ← planner polinomial (MATLAB codegen)
+    ├── cos.cpp                            ← stub vazio (MATLAB codegen)
+    ├── minOrMax.cpp                       ← saturação ±12 (MATLAB codegen)
+    ├── mldivide.cpp                       ← solver LU (MATLAB codegen)
+    ├── rt_nonfinite.cpp                   ← constantes NaN/Inf (MATLAB codegen)
+    └── sqrt.cpp                           ← stub vazio (MATLAB codegen)
 ```
 
 ## Convenções adotadas nesta documentação
