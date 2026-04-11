@@ -17,6 +17,10 @@ Bem-vindo à documentação do pacote `my_drone_controller`. Esta documentação
 | [09 — APIs e Exemplos de Uso](09-apis-e-exemplos-de-uso.md) | Como comandar o controlador via tópicos, exemplos C++ e observabilidade |
 | [10 — Simulação e tmux](10-simulacao-e-tmux.md) | Como o `session.yml` do MRS UAV Gazebo Simulator foi modificado para integrar o `drone_node` |
 | [11 — Subscribers e Callbacks](11-subscribers-e-callbacks.md) | Tabela completa de subscribers, detalhamento de cada callback, guards anti-echo e exemplos C++ de publicação |
+| [12 — `main.cpp` e Estado 0](12-main-e-estado0.md) | Linha a linha: ponto de entrada do executável (`main.cpp`) e estado ocioso da FSM (`fsm_state0_wait.cpp`) |
+| [13 — Validação de Waypoints](13-waypoint-validation.md) | Linha a linha: `waypoint_validation.cpp` — verificações de NaN/Inf, limites de altitude e distância XY |
+| [14 — Fila de Comandos](14-command-queue.md) | Linha a linha: `command_queue.hpp` + `command_queue.cpp` — rastreabilidade, histórico, timeout e log de auditoria |
+| [15 — Planner e Controlador Codegen](15-codegen-planner-e-controlador.md) | Linha a linha: `TrajectoryPlanner_codegen.cpp` (polinômio) + `Drone_codegen.cpp` (PID de posição) |
 
 ## Resumo rápido do pacote
 
