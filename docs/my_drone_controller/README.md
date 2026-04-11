@@ -16,6 +16,7 @@ Bem-vindo à documentação do pacote `my_drone_controller`. Esta documentação
 | [08 — FSM Pouso](08-fsm_landing.md) | `fsm_landing.cpp`: `complete_landing`, `handle_state4_disarm_reset`, timeout e transição para estado 0 |
 | [09 — APIs e Exemplos de Uso](09-apis-e-exemplos-de-uso.md) | Como comandar o controlador via tópicos, exemplos C++ e observabilidade |
 | [10 — Simulação e tmux](10-simulacao-e-tmux.md) | Como o `session.yml` do MRS UAV Gazebo Simulator foi modificado para integrar o `drone_node` |
+| [11 — Subscribers e Callbacks](11-subscribers-e-callbacks.md) | Tabela completa de subscribers, detalhamento de cada callback, guards anti-echo e exemplos C++ de publicação |
 
 ## Resumo rápido do pacote
 
