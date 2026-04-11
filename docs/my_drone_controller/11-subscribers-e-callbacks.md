@@ -667,7 +667,7 @@ void DroneControllerCompleto::waypoints_callback(
 }
 ```
 
-### Árbol de Decisão
+### Árvore de Decisão
 
 ```
 PoseArray recebida
