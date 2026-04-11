@@ -25,11 +25,11 @@
 | 9 | [`waypoint_validation.cpp`](#9-waypoint_validationcpp) | Validação de entrada | [13-waypoint-validation.md](13-waypoint-validation.md) |
 | 10 | [`Drone_codegen.cpp`](#10-drone_codegencpp) | Controlador PID codegen | [15-codegen-planner-e-controlador.md](15-codegen-planner-e-controlador.md) |
 | 11 | [`TrajectoryPlanner_codegen.cpp`](#11-trajectoryplanner_codegencpp) | Planner polinomial codegen | [15-codegen-planner-e-controlador.md](15-codegen-planner-e-controlador.md) |
-| 12 | [`cos.cpp`](#12-coscpp) | Helper matemático codegen | — |
-| 13 | [`minOrMax.cpp`](#13-minormaxcpp) | Helper matemático codegen | — |
-| 14 | [`mldivide.cpp`](#14-mldividecpp) | Helper matemático codegen | — |
-| 15 | [`rt_nonfinite.cpp`](#15-rt_nonfinitecpp) | Helper matemático codegen | — |
-| 16 | [`sqrt.cpp`](#16-sqrtcpp) | Helper matemático codegen | — |
+| 12 | [`cos.cpp`](#12-coscpp) | Helper matemático codegen | [16-codegen-helpers-matematicos.md](16-codegen-helpers-matematicos.md#5-coscpp--stub-vazio-compatibilidade-de-codegen) |
+| 13 | [`minOrMax.cpp`](#13-minormaxcpp) | Helper matemático codegen | [16-codegen-helpers-matematicos.md](16-codegen-helpers-matematicos.md#3-minormaxcpp--saturação-de-vetores-e-escalares) |
+| 14 | [`mldivide.cpp`](#14-mldividecpp) | Helper matemático codegen | [16-codegen-helpers-matematicos.md](16-codegen-helpers-matematicos.md#4-mldividecpp--solver-de-sistemas-lineares-por-eliminação-gaussiana-com-pivotamento-parcial) |
+| 15 | [`rt_nonfinite.cpp`](#15-rt_nonfinitecpp) | Helper matemático codegen | [16-codegen-helpers-matematicos.md](16-codegen-helpers-matematicos.md#2-rt_nonfinitecpp--constantes-globais-nan--inf) |
+| 16 | [`sqrt.cpp`](#16-sqrtcpp) | Helper matemático codegen | [16-codegen-helpers-matematicos.md](16-codegen-helpers-matematicos.md#6-sqrtcpp--stub-vazio-compatibilidade-de-codegen) |
 
 ---
 

@@ -22,6 +22,7 @@ Bem-vindo à documentação do pacote `my_drone_controller`. Esta documentação
 | [13 — Validação de Waypoints](13-waypoint-validation.md) | Linha a linha: `waypoint_validation.cpp` — verificações de NaN/Inf, limites de altitude e distância XY |
 | [14 — Fila de Comandos](14-command-queue.md) | Linha a linha: `command_queue.hpp` + `command_queue.cpp` — rastreabilidade, histórico, timeout e log de auditoria |
 | [15 — Planner e Controlador Codegen](15-codegen-planner-e-controlador.md) | Linha a linha: `TrajectoryPlanner_codegen.cpp` (polinômio) + `Drone_codegen.cpp` (PID de posição) |
+| [16 — Helpers Matemáticos Codegen](16-codegen-helpers-matematicos.md) | Bloco a bloco: `cos.cpp`, `sqrt.cpp`, `minOrMax.cpp` (saturação ±12 m/s), `mldivide.cpp` (pivotamento LU), `rt_nonfinite.cpp` (NaN/Inf) |
 
 ## Resumo rápido do pacote
 
@@ -51,11 +52,11 @@ my_drone_controller/
     ├── waypoint_validation.cpp
     ├── Drone_codegen.cpp                  ← controlador PID (MATLAB codegen)
     ├── TrajectoryPlanner_codegen.cpp      ← planner polinomial (MATLAB codegen)
-    ├── cos.cpp                            ← stub vazio (MATLAB codegen)
-    ├── minOrMax.cpp                       ← saturação ±12 (MATLAB codegen)
-    ├── mldivide.cpp                       ← solver LU (MATLAB codegen)
-    ├── rt_nonfinite.cpp                   ← constantes NaN/Inf (MATLAB codegen)
-    └── sqrt.cpp                           ← stub vazio (MATLAB codegen)
+    ├── cos.cpp                            ← stub vazio (MATLAB codegen)       ← [16]
+    ├── minOrMax.cpp                       ← saturação ±12 m/s (MATLAB codegen) ← [16]
+    ├── mldivide.cpp                       ← solver LU (MATLAB codegen)         ← [16]
+    ├── rt_nonfinite.cpp                   ← constantes NaN/Inf (MATLAB codegen) ← [16]
+    └── sqrt.cpp                           ← stub vazio (MATLAB codegen)        ← [16]
 ```
 
 ## Convenções adotadas nesta documentação
