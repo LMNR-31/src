@@ -83,7 +83,7 @@ public:
     this->declare_parameter<double>     ("h_collect_time_s", 1.0);
     this->declare_parameter<double>     ("h_timeout_s",     0.75);
     this->declare_parameter<double>     ("max_h_range_m",   6.0);
-    this->declare_parameter<bool>       ("prefer_closest_h", false);
+    this->declare_parameter<bool>       ("prefer_closest_h",  false);
     this->declare_parameter<double>     ("xy_hold_tol",      0.10);
     this->declare_parameter<double>     ("xy_hold_stable_s", 1.0);
     this->declare_parameter<double>     ("xy_abort_tol",     0.5);
